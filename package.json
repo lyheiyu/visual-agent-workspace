@@ -4,6 +4,9 @@
   "description": "Watch AI coding agents work in real time (files, functions, diffs, commands) with approvals, plus an optional local Ollama reviewer.",
   "version": "0.5.0",
   "publisher": "visual-agent-workspace",
+  "repository": { "type": "git", "url": "https://github.com/lyheiyu/visual-agent-workspace.git" },
+  "homepage": "https://github.com/lyheiyu/visual-agent-workspace#readme",
+  "bugs": { "url": "https://github.com/lyheiyu/visual-agent-workspace/issues" },
   "license": "MIT",
   "private": true,
   "engines": {

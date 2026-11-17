@@ -4,7 +4,7 @@
 
 ## 直接安装
 
-1. 下载 `visual-agent-workspace-0.5.0.vsix`。
+1. 从 [GitHub Releases](https://github.com/lyheiyu/visual-agent-workspace/releases) 下载 `visual-agent-workspace-0.5.0.vsix`。
 2. 打开 VS Code，按 `Ctrl+Shift+X` 打开扩展。
 3. 点击扩展面板右上角 `…` → **从 VSIX 安装 / Install from VSIX…**，选择下载的文件。
 4. 打开你的真实项目，点击左侧 **Visual Agent** → **会话**。
@@ -40,7 +40,7 @@ npm run package:vsix
 如需手动推送，先在 GitHub 建一个空仓库，再在项目终端运行：
 
 ```powershell
-git remote add origin https://github.com/你的用户名/visual-agent-workspace.git
+git remote add origin https://github.com/lyheiyu/visual-agent-workspace.git
 git push -u origin main
 ```
 
