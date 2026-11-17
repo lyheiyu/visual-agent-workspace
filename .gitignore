@@ -1,0 +1,16 @@
+node_modules/
+out/
+*.vsix
+demo-workspace/.pytest_cache/
+demo-workspace/**/__pycache__/
+.vscode-test/
+.vscode/visual-agent.local.code-workspace
+artifacts/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log

@@ -1,0 +1,11 @@
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const root = path.resolve(__dirname, '..');
+const manifest = require('../package.json');
+const directory = path.join(root, 'artifacts');
+fs.mkdirSync(directory, { recursive: true });
+const vscePackage = require.resolve('@vscode/vsce/package.json');
+const vsce = path.join(path.dirname(vscePackage), require(vscePackage).bin.vsce);
+const output = path.join(directory, `${manifest.name}-${manifest.version}.vsix`);
+execFileSync(process.execPath, [vsce, 'package', '--allow-missing-repository', '--no-rewrite-relative-links', '--out', output], { cwd: root, windowsHide: true, stdio: 'inherit' });

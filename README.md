@@ -1,0 +1,522 @@
+# Visual Agent Workspace (v0.5)
+
+Install the VSIX from this project's GitHub release or build artifact using **Extensions → … → Install from VSIX…**. Then open your real project and click **Visual Agent → Conversations**; F5 is only needed for developing the extension. See [中文安装与迁移说明](INSTALL.zh-CN.md).
+
+A VS Code extension that makes AI coding agents **observable, interruptible and auditable**. You can see each operation an agent performs, follow it in the editor, inspect proposed changes as diffs, and approve or reject them before they proceed.
+
+Coding agents, chosen in **New Agent Task** (see [Multi-agent coding](#multi-agent-coding-v04)):
+
+| Agent | Runtime | Status |
+|---|---|---|
+| **Codex** | Codex App Server (isolated session) | Available. Live-tested. |
+| **Local agent** | [OpenCode](https://opencode.ai) runtime with your **local Ollama** model | Available. Live-tested with `qwen3:8b`, `gpt-oss:20b` and `qwen3.8:27b`. |
+| **Claude Code** | Official Claude Code runtime + Agent SDK | Experimental integration. Official subscription login, API-key, Bedrock, Vertex or Foundry auth. Pro subscription read-only and follow-up tested live. |
+| Mock demo | Scripted, simulated | Unchanged since v0.1 |
+
+v0.3 adds function-level live tracking, an optional **Local AI Reviewer** (Ollama), and **review-context export**. It has two independent layers:
+
+| Layer | What it does | LLM usage |
+|---|---|---|
+| **A. Real-time observer** | Records the agent's real tool events: files, functions (parsed), diffs, commands, output. Updates the timeline and navigates. | **None.** No extra Codex prompts, nothing added to the agent's context, no automatic analysis. |
+| **B. Local AI Reviewer** (optional) | Explain a function, review a change, impact analysis, explain a failure. | **Only when you click**, only on your local Ollama (`127.0.0.1` by default). No cloud tokens, no Codex quota. Can be disabled completely. |
+
+> Design principle: **Propose → Inspect → Approve/Reject → Execute → Record → Review**
+
+---
+
+## Quick start
+
+Requirements: VS Code ≥ 1.85 and Node.js ≥ 18.
+
+```bash
+npm install
+npm run compile
+```
+
+**Launch with F5:**
+
+1. Open this folder in VS Code.
+2. Press **F5** (or pick *Run and Debug → "Run Visual Agent Workspace (demo workspace)"*). This compiles the extension and opens an **Extension Development Host** window with `demo-workspace/` as its folder.
+3. In that window, click the **eye icon (Visual Agent)** in the Activity Bar.
+4. Click **▶ Start demo** in *Agent Activity*.
+
+## Using it
+
+| Feature | Where |
+|---|---|
+| Timeline of operations (step #, time, type, status, file › function) | *Agent Activity* sidebar |
+| Operation details, command, result, audit trail | Click an operation (lower part of the sidebar) |
+| Jump to code and highlight the function | Click an operation, or **Go to code** |
+| Follow Agent toggle | Checkbox in the sidebar, or the eye icon in the view title |
+| Pause / Resume / Stop | Sidebar buttons, view-title icons, Command Palette (`Visual Agent: …`) |
+| Approve / Reject | Orange *Approval needed* banner, the operation's details, the notification, or the Command Palette |
+| Review a proposed change (diff) | **Review diff** opens VS Code's diff editor: original ↔ proposed (not applied) |
+| Command details (cwd, timestamps, exit code, stdout/stderr) | *Agent Commands* view; click an entry for the full output |
+| Task summary | `…` menu → *Show Task Summary*, or the notification at the end of a task |
+| Past tasks | Task selector in the sidebar (history persists per workspace) |
+
+### Demo task: "Inspect and improve a data import validation function"
+
+1. **Read** `importer.py`
+2. **Analyze** `load_data()`
+3. **Read** `validation.py`
+4. **Analyze** `validate_samples()`
+5. **Edit** (proposed): stricter `validate_samples()`. The diff opens beside the code and the agent **waits for your decision**.
+6. **Test** (simulated): `python -m pytest tests/test_validation.py -v`
+   - If you approved the edit, the simulated output is *5 passed* (exit 0).
+   - If you rejected it, the simulated output is *3 failed, 2 passed* (exit 1). The original function lets bad rows through.
+7. **Summary**: built from the recorded events, not written by a model.
+
+Whether you approve or reject, `validation.py` on disk is never modified.
+
+### Live Tracking and Live Follow
+
+- **Live Tracking** is always on for a connected session. Every event is recorded and the timeline updates as events arrive. It's shown as "● Live tracking · now: …" in the header.
+- **Live Follow** (checkbox) is optional editor navigation. Turning it off never stops recording.
+- **On**: when the agent touches a file, that file opens in a preview tab with the function highlighted, and proposed edits open as a diff beside it. Keyboard focus stays where it was (`preserveFocus`), and the details pane tracks the newest operation. Bursts are coalesced: the editor moves at most once per 300 ms, always to the latest operation.
+- **Off**: new events never change the editor. Navigation only happens when you click.
+- The setting is stored in VS Code's workspace state, not `settings.json`, so toggling it never writes workspace files.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `visualAgent.stepDelayMs` | `1500` | Pause between mock operations, so each one is visible |
+| `visualAgent.followAgentByDefault` | `true` | Initial Follow state for a new workspace |
+| `visualAgent.requireApprovalForCommands` | `false` | Also gate Execute/Test operations behind approval. Edits are always gated. |
+| `visualAgent.allowNavigationOutsideWorkspace` | `false` | Allow opening files outside the workspace folder |
+
+### Function-level change tracking (v0.3)
+
+For every real patch, Visual Agent:
+- extracts the **changed line ranges** from the hunks (added or modified lines in the patched file; pure removals in the original);
+- finds the **affected functions** by parsing the actual file text, both before and after the patch (Python indentation, TypeScript/JavaScript braces). Lines outside any parsed definition get **no** function name, so names are never invented;
+- labels an edit with a single function only when exactly one was found.
+
+In the details pane, **Affected functions** jumps to each one and **Changed lines** lists the ranges. Clicking an applied patch highlights its actual changed lines on disk. A patch that is still proposed jumps to where it will land, and the diff shows its content.
+
+### Local AI Reviewer (v0.3)
+
+Panel: **Visual Agent → Local AI Reviewer**. Commands are also in the editor context menu and the Command Palette (`Visual Agent: … (Local AI)`).
+
+| Action | Input it uses (minimal context) |
+|---|---|
+| **Explain function** | The function at the cursor: language-server symbols first, then the text parser, then your selection. Includes import lines and line numbers. |
+| **Review change** | The selected Edit operation, or the latest recorded change to the function at the cursor: the **recorded diff**, plus the original and modified function |
+| **Impact analysis** | The function, plus call sites from language-server references (or a labeled heuristic text search), plus workspace functions it calls |
+| **Explain error** | The selected failed command or test: command, exit code, the last 80 output lines, and code at `file:line` references found in the output (workspace only) |
+
+- **Models:** discovered with `GET /api/tags` when the panel is first shown or on refresh. Pick any installed model from the dropdown. `qwen3:8b` is preselected if installed; otherwise `visualAgent.reviewer.model`, otherwise the first model. Nothing is hardcoded or downloaded.
+- **Streaming and cancellation:** `POST /api/chat` with `stream: true`. Results stream into the panel and into a read-only document beside the code. **■ Cancel** aborts the HTTP request.
+- **Read-only:** the reviewer returns text. It can't edit files, run commands, apply patches, or talk to the coding agent. Results are labeled *"Model-generated, not verified by execution."*
+- **Privacy and quota:** only the configured endpoint is used, and non-loopback hosts are refused unless `visualAgent.reviewer.allowRemoteEndpoint` is on. Context is redacted for secrets and capped at `maxContextChars`; lower-priority sections are dropped first.
+- **Caching:** results are cached in memory, keyed by a SHA-256 of model, thinking mode and the exact prompt (which includes the code), so unchanged code isn't re-analysed.
+- **Copy / Export .md** of each result is available. If Ollama is offline, the panel shows *Ollama unavailable* with the reason, and everything else keeps working.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `visualAgent.reviewer.enabled` | `true` | `false` = no requests to Ollama at all; AI buttons hidden |
+| `visualAgent.reviewer.endpoint` | `http://127.0.0.1:11434` | Ollama endpoint (loopback only by default) |
+| `visualAgent.reviewer.model` | *(auto)* | Preferred installed model |
+| `visualAgent.reviewer.thinking` | `off` | Reasoning mode. gpt-oss can't disable it; `off` maps to `low`. |
+| `visualAgent.reviewer.contextWindow` | `8192` | `num_ctx`. Larger uses more GPU/RAM. |
+| `visualAgent.reviewer.maxContextChars` | `12000` | Context budget per request |
+
+### Language / 语言
+
+The language selector (top right of *Agent Activity* and *Local AI Reviewer*, or **Visual Agent: Select Language**) offers **中文** (default), **English** and **中英双语**. The choice is stored in the user setting `visualAgent.language`, so it survives restarts. It never affects the coding agent.
+
+- **UI labels** come from a static string table ([src/i18n/i18n.ts](src/i18n/i18n.ts)); no LLM is involved. Manifest strings use `package.nls.json` and `package.nls.zh-cn.json`, which follow VS Code's display language. Commands, code, paths, tool output, stack traces and agent text are never translated.
+- **New reviews** ask the local model to answer **directly** in the selected language. 中英双语 produces both languages from **one** request. Identifiers, code, paths, commands, exception and API names stay unchanged. The language is part of the cache key.
+- **Translate / 翻译** on an existing result uses the currently selected local model, never a cloud API. The original is kept, and output streams and can be cancelled. Translations are cached by (hash of the original text, source language, target language, model), so switching between *Original*, *中文*, *English* and *中英双语* makes no new request. A warning appears if any code span from the original is missing from the translation.
+- Nothing is translated automatically: not tool events, not reviews. Nothing is added to Codex or Claude Code sessions.
+
+Real check (`npm run test:ollama:i18n`, `qwen3:8b`, 9/9):
+- The Chinese and English answers came back in the requested language, with identifiers kept.
+- The bilingual answer came from one request.
+- The English-to-Chinese translation kept all 12 of 12 code spans.
+- Switching cached versions made no request, and cancelling a translation stopped it within 2 ms.
+
+### Export review context (v0.3)
+
+Use **Export…** in an operation's details, the *Agent Activity* `…` menu, or the editor context menu. Pick a scope: **function at the cursor**, **a change**, **several operations**, or **the entire task**. The result is a Markdown report that opens as a **read-only preview first** (secrets redacted). It's copied or saved only when you click **Copy to Clipboard** or **Save As…**. It's never sent anywhere.
+
+Every item is labeled:
+- **[verified]**: recorded from the agent's tool events or read from disk. This covers diffs exactly as reported, command, exit code and output, decisions, and code on disk.
+- **[derived]**: computed from verified data, for example the modified function produced by applying the recorded diff.
+- **[inferred]**: local parsing or heuristics, for example affected functions and related call sites.
+
+Exports never include model-generated text. Simulated (mock) commands are marked **SIMULATED**.
+
+---
+
+## Conversations and turn results
+
+Click **Conversations / 会话** in Agent Activity, or run **Visual Agent: 会话 / Conversations**. The editor opens a session list and chat with an inline composer. New agent tasks open there automatically. Clicking a session restores its retained transcript, project and model; the last selected conversation is remembered in the same VS Code workspace. Drafts are kept per conversation while the panel is retained/reloaded. The operation timeline stays available in the sidebar for navigation and detailed audit records.
+
+Selecting or browsing a project now opens its **actual folder in VS Code Explorer**, rather than changing only the agent's working directory. In a window already using a workspace file, a project not already open is added alongside existing roots and revealed without restarting the extension host. Entering a saved conversation reveals its project too; **Show project in Explorer / 打开项目文件夹** in the conversation header returns to the file tree at any time. Existing roots remain open.
+
+F5 now prepares a local, ignored `.vscode/visual-agent.local.code-workspace` file so adding projects works without a restart. For an existing single-folder/empty window, the first new project converts it to a managed workspace file under extension storage. VS Code reloads once: retained conversations are transferred, an idle provider session is closed normally, and a pending task form is restored. A busy turn must finish or be stopped before that conversion. Subsequent additions do not require another conversion. No project source files are moved or copied.
+
+**Local Ollama sessions:** when a turn completes, the UI says **Turn complete · waiting for input**, not Running. Send another message in the composer to continue the same OpenCode session. **End session** closes the idle runtime; **Stop** interrupts work. Switching to another conversation automatically closes the previous idle runtime; switching while a turn or approval is pending is blocked. After closing or reloading, sending in that conversation restarts its private OpenCode server and restores the persisted session ID, validating its project directory. It sends only the new message, not a reconstructed transcript. If restoration fails, the error is shown; choose **Continue with saved context instead** explicitly to start a new provider session under the same visible conversation. Models and permissions are not silently changed. The native history depends on OpenCode data under the extension's global storage remaining available.
+
+**Codex, Claude and older records:** live follow-ups remain in the active session where supported. Closed Codex/Claude conversations currently continue using bounded saved context in a new provider session; that mode is labeled in the chat. Older tasks without saved provider/model settings use **Copy history into a new task…** to configure them. Conversations from the separate Codex/Claude extension chat panels are not imported.
+
+**Every turn has a result immediately**, before closing the session: recorded file edits and their statuses, commands/test exit codes, failures, rejections and cancellations. Reports are built from tool events with no additional model request; they do not claim that unrecorded changes or tests happened. An interrupted/reloaded turn is marked Stopped. The final task summary remains available when the session ends.
+
+**Use one Ollama model:** ask the coding agent to explain code in the same conversation, or open a source file, place the cursor in a function, and click **Explain the current function / 解释当前函数** in chat. This sends a read-and-explain instruction to the same coding model and session, without starting the independent reviewer. The separate reviewer is blocked while a local coding turn is busy; local coding is also blocked while the reviewer is generating.
+
+Defaults retain 20 tasks, 200 messages and 100 turn reports per task in VS Code workspace storage. Long fields are truncated and secrets redacted on a best-effort basis. The sidebar previews recent messages; chat and transcript documents show all retained messages. Clear History deletes extension records; it does not erase the OpenCode runtime's own database. Older records recover known assistant replies where available; missing or previously truncated text cannot be recovered.
+
+Single-model real acceptance (GPU inference in a disposable JS repository): `npm run test:local-conversation`. It refuses to load a second Ollama model and checks explain → approved edit → real test → follow-up → new process/native resume with a remembered marker. Set `VAW_CONVERSATION_MODEL` to use another installed tool-capable model.
+
+## Multi-agent coding (v0.4)
+
+**Start a task:** click **▶ New agent task…** in Agent Activity (or run *Visual Agent: New Agent Task…*). The panel asks for:
+
+| Field | Behavior |
+|---|---|
+| Coding agent | Codex, Claude Code or Local agent. Unavailable providers stay visible with the reason (for example "Ollama not reachable" or "sign in through official Claude Code"). |
+| Coding model | **Discovered from the provider** when you select it. Codex uses `model/list`, the local agent uses Ollama `/api/tags` plus `/api/show`, and Claude Code uses the SDK's `supportedModels()`. Nothing is hardcoded. Local models without tool-calling are listed as *incompatible* and can't be chosen. |
+| Reasoning effort | Shown only when the model reports supported levels (Codex `supportedReasoningEfforts`, Claude `supportedEffortLevels`) |
+| Workspace | Follows changes to the open workspace folders; in multi-root windows, defaults to the active file's project. **Browse project…** can select another local project. Existing tasks stay pinned to their original project; the task header shows that path and recorded operations navigate within that task's root. |
+| Execution profile | Read-only, or approve each edit and command (Codex keeps its three v0.2 profiles) |
+| Instructions | The task |
+
+- **No silent substitution.** The launcher refuses a model the provider didn't report. Codex must echo the selected model in `thread/start`, or the task aborts before any turn. For the local agent, every assistant message must report `ollama/<selected model>`, or the task aborts.
+- **The timeline's first entry shows the provider and model actually running**, for example `Codex session started: gpt-5.6-sol (effort low)` or `Local agent session started: OpenCode + Ollama qwen3:8b`.
+- **Remembered per provider:** the last selection whose task *completed successfully* (stored in VS Code global state).
+- **Multi-turn (local agent, Claude Code):** the session stays open after each turn and the header shows *Waiting for your next instruction*. **✎ Send follow-up** continues the **same** session, and **■ End session** finishes it. **Stop** interrupts at any time.
+
+### Local agent (OpenCode + Ollama)
+
+Visual Agent doesn't implement its own agent loop. It runs the existing **OpenCode** runtime (`opencode serve`, HTTP + SSE API) and observes it.
+
+- **Local inference only.** OpenCode's built-in cloud provider (`opencode`) is disabled, only `ollama` is enabled, and both `model` and `small_model` (used for titles and summaries) point at your local model. Each assistant message is checked for `providerID=ollama` and the selected `modelID`.
+- **Isolation.** Each task runs a dedicated server on `127.0.0.1` with a private home (`XDG_*` directories under the extension's global storage) and an inline config (`OPENCODE_CONFIG_CONTENT`), started with `--pure` (no external plugins). Your own `~/.config/opencode` is never read or changed. The binary is spawned without a shell.
+- **Permissions are enforced by OpenCode itself.**
+
+  | Profile | edit | bash | read of `.env`, keys, `.git` | web, sub-agents, outside-workspace |
+  |---|---|---|---|---|
+  | Read-only | deny | deny | deny | deny |
+  | Approve each edit and command | **ask** | **ask** | deny | deny |
+
+  An `ask` blocks the tool until Visual Agent replies (`permission.asked` → `POST /permission/:id/reply`). That's real interception: in the live test, `math.js` stayed byte-for-byte unchanged while approval was pending. Before asking you, Visual Agent itself declines edits outside the workspace or to protected files, and any permission the profile doesn't grant. Commands like `rm`, `git reset --hard` or `git push` are flagged ⚠ *potentially destructive* in the approval.
+- **Diffs before approval.** OpenCode sends the unified diff with the edit permission request. Visual Agent also computes it from the tool input against the file on disk, then finds affected functions and changed lines with the v0.3 parser.
+- **Resources.** Before starting, Visual Agent checks Ollama `/api/ps`. If a *different* model is loaded, it asks first (**Unload Others and Start**, **Start Anyway**, or cancel), so two large models are never loaded automatically. The same check runs before a Local AI Review would load a second model while the local agent is running. `visualAgent.local.contextLimit` (default 32768, capped by the model's own limit) and `visualAgent.local.outputLimit` bound the context and output size.
+- **Requirements.** Ollama running, plus OpenCode (`npm install -g opencode-ai`, or set `visualAgent.local.opencodePath`). During development it's taken from this project's `node_modules`. On first use, OpenCode downloads its `@ai-sdk/openai-compatible` provider package from npm into its private cache. That's a package download, not inference.
+
+### Claude Code (experimental)
+
+The **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`, the Claude Code harness as a library) runs the session in your workspace.
+
+- **Authentication.** The extension locates the official Claude Code binary and asks it for safe login metadata (`claude auth status --json`); it never reads, copies or stores credentials. An existing Claude subscription login can be used. Set `visualAgent.claude.authMode` to `subscription` to use only that login, with API/cloud/proxy overrides removed from the child process environment. `auto` retains configured API/cloud auth, otherwise uses subscription login. `api` never falls back to subscription. Before sending a task prompt, SDK `accountInfo()` must confirm the chosen auth kind. A subscription session will not silently switch to API-key billing, including when continuing a saved conversation. Log in through official Claude Code if needed; do not put credentials in this repository.
+- **Runtime.** Install the official Claude Code VS Code extension or CLI. Auto-discovery uses its native executable; `visualAgent.claude.executablePath` can override it. The VSIX includes the SDK library but excludes the platform-specific bundled Claude binary, so it stays portable and small. SDK-reported dollar estimates are labeled as estimates when using subscription quota, not an API invoice.
+- **Permissions.** `permissionMode: "default"`, so Claude Code calls `canUseTool` before any edit or shell command, and the tool waits for your decision. Read-only adds `disallowedTools` for Edit, Write, Bash, web and Task. Protected and outside-workspace paths are denied.
+- **Isolation.** `settingSources: []`: no user or project settings, hooks or permission rules are loaded or modified.
+- **Status.** No API key is configured in this development environment, so the adapter is covered by **fixture contract tests**: the message stream, `canUseTool` blocking, follow-ups, auth refusal, and read-only denial. It wasn't run live. Treat it as experimental.
+
+### Coding model ≠ reviewer model
+
+The **coding model** (New Agent Task) and the **reviewer model** (Local AI Reviewer dropdown) are separate settings. Changing the reviewer model never touches a running coding session, and the reviewer stays read-only. For example: a local agent on `qwen3.8:27b`, reviewed with `gpt-oss:20b`.
+
+---
+
+## Codex mode (v0.2)
+
+**Requirements:** a Codex native runtime and Codex login. Auto-discovery prefers the newest installed Codex VS Code extension's bundled runtime, then global npm and PATH installations. `visualAgent.codex.executablePath` overrides discovery. This avoids an older npm runtime hiding models already available in the Codex extension. Models and supported reasoning efforts still come from the selected runtime; **Light (low)** sends `low`, and does not change the selected model.
+
+**Start:** click **▶ Codex task…** in Agent Activity (or run *Visual Agent: Start Codex Task…*). Enter your instructions and pick a safety profile.
+
+### What you can and cannot control
+
+Every operation in the timeline is labeled with how much control Visual Agent had:
+
+| Label | Meaning |
+|---|---|
+| **OBSERVED** | Codex reported the operation **without asking**. Visual Agent could only record it. Its only constraint was Codex's sandbox. |
+| **INTERCEPTED** | Codex **stopped and waited** for your decision, and enforced it before running anything. A rejected command never runs (it has no exit code). A rejected patch writes nothing. |
+| **GATED** | Mock demo only. The Visual Agent controller itself held the simulated step. |
+
+The details pane spells out the explanation for the selected operation.
+
+### Safety profiles
+
+All three profiles use Codex's **read-only sandbox**. Shell commands can never write, even after you approve them; this was verified on Windows, where an approved `Set-Content` failed with *Access to the path … is denied*. The only way a file can change is a Codex patch that you approve in **Approve each command and each edit**.
+
+| Profile | Codex `approvalPolicy` | Commands | Patches (edits) |
+|---|---|---|---|
+| **Observe only** (default) | `on-request` | Run without asking, read-only (**observed**). Escalation requests are declined automatically. | Declined automatically |
+| **Approve each command** | `untrusted` | Codex must ask first (**intercepted**). Approved commands still run read-only. | Declined automatically |
+| **Approve each command and each edit** | `untrusted` | As above | Codex must ask first. You see the full diff. **Approving applies that entire patch.** |
+
+Additional safeguards:
+- After `thread/start`, the adapter checks that Codex confirms `sandbox=readOnly` and the requested approval policy. If it doesn't, the task aborts before any turn starts.
+- Approvals are always single-use (`accept`, `decline` or `cancel`). It never sends `acceptForSession`, policy amendments, or session-wide write grants (`grantRoot`).
+- Patches are declined automatically if they touch a path outside the workspace or inside `.git`, or if Codex didn't report their content (so they can't be reviewed).
+- Requests for additional sandbox permissions are always declined. Interactive questions and MCP elicitations are answered empty or declined.
+- The edit profile is offered only for git repositories, and it warns about uncommitted changes, so every approved patch can be reviewed and reverted with git.
+
+**Not per-function:** a decision covers the **whole patch**, which may span several functions or files. Function names shown for edits are *inferred* from the patch location, for navigation only.
+
+### Controls in Codex mode
+
+| Control | Effect |
+|---|---|
+| **Stop** | Sends `turn/interrupt` for the active turn, answers every pending approval with `cancel`, then closes the session's process. |
+| **Pause** | **Not available.** Codex cannot be paused mid-turn. The button is disabled with an explanation; use Stop or Send instruction. |
+| **✎ Send instruction** | Sends `turn/steer` with `expectedTurnId`, so the instruction is rejected if a different turn is active. It's recorded in the audit trail as an *Instruct* operation. Instructions **cannot** change the sandbox or approval policy, and pending approvals stay pending. |
+| **Approve / Reject / Review diff** | As in the demo. The diff is reconstructed from Codex's unified-diff hunks against the current file. If a hunk doesn't apply, the raw patch is shown and nothing is guessed. |
+
+### Isolation: what this does *not* do
+
+- Each task starts its **own** `codex app-server` child process and an **ephemeral** thread, so it isn't saved to your Codex history.
+- **It cannot see or intercept any other Codex session**, including the official Codex VS Code extension, the Codex CLI in a terminal, or Codex cloud tasks. Those run in separate processes that this extension doesn't connect to.
+- The child process reuses your `~/.codex` login and config. Config isn't modified, but these command-line overrides apply to the child only: `--disable plugins remote_plugin apps hooks multi_agent computer_use browser_use image_generation` and `-c mcp_servers={}`. User hooks, MCP servers and sub-agents could otherwise act outside the observed item stream.
+- The model comes from `visualAgent.codex.model`, or else from the server's `model/list` default. It doesn't use your config's `model`, which may not be available to your account.
+- Codex is spawned **without a shell**: the native binary is located inside the npm package, because the `.cmd` shim would need `shell: true`.
+
+### Codex settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `visualAgent.codex.defaultProfile` | `observe` | Profile preselected in the picker |
+| `visualAgent.codex.model` | *(server default)* | Model id |
+| `visualAgent.codex.executablePath` | *(auto)* | Native `codex`/`codex.exe` binary (not `.cmd`) |
+| `visualAgent.codex.maxTurnMinutes` | `30` | Interrupt a turn that runs longer than this |
+
+---
+
+## Architecture
+
+```
+            ┌──────────────────────┐   nextOperation() / execute() / onDecision()
+            │ AgentAdapter (iface) │◄──────────────────────────────┐
+            │  └ MockAgentAdapter  │                               │
+            └──────────────────────┘                               │
+                                                        ┌──────────┴──────────┐
+  UI gestures ──► HumanControlManager ── pause/resume/ ─►│   AgentController   │
+  (webview,        │  (selection, Follow,  stop/approve/ │  (state machine)    │
+   commands,       │   notifications)      reject        └──────────┬──────────┘
+   notifications)  │                                                │ record / update
+                   │                                     ┌──────────▼──────────┐
+                   │ reads ◄──────────────────────────── │   EventRecorder     │── workspaceState
+                   ▼                                     │ (audit trail, IDs,  │   (no source code)
+   ActivityViewProvider · CommandTreeProvider            │  redaction)         │
+   RecordDocumentProvider · CodeNavigator ·              └─────────────────────┘
+   ChangeReviewManager (in-memory diffs)
+```
+
+Core modules (`types`, `adapters`, `controller`, `recorder`, path safety, symbol search, view model) don't import `vscode` and are unit-tested in plain Node. State management is fully separate from rendering: the webview receives a serializable view model and sends back intents.
+
+### Modules
+
+| File | Responsibility |
+|---|---|
+| [src/extension.ts](src/extension.ts) | Entry point. Wires the modules together and picks the adapter. |
+| [src/types/events.ts](src/types/events.ts) | Typed event model: `AgentOperation`, `CommandExecution`, `TaskRecord`, `ChangeRecord`, `StatusTransition`… |
+| [src/adapters/AgentAdapter.ts](src/adapters/AgentAdapter.ts) | **Adapter interface**: `beginTask`, `nextOperation` (propose, no side effects), `execute` (only after the controller allows it), `onDecision`, `endTask`. |
+| [src/adapters/MockAgentAdapter.ts](src/adapters/MockAgentAdapter.ts), [demoScenario.ts](src/adapters/demoScenario.ts) | Scripted, side-effect-free mock agent and the demo scenario |
+| [src/controller/AgentController.ts](src/controller/AgentController.ts) | Execution state machine: `start`, `pause`, `resume`, `stop`, `approve`, `reject`, plus an approval policy hook |
+| [src/recorder/EventRecorder.ts](src/recorder/EventRecorder.ts) | Chronological history. Assigns IDs and sequence numbers, keeps an append-only status audit trail, persists, prunes, and marks interrupted work after a reload. |
+| [src/recorder/redaction.ts](src/recorder/redaction.ts) | Secret redaction and output truncation, applied before anything is stored |
+| [src/recorder/summary.ts](src/recorder/summary.ts) | Factual task summary built from the audit trail |
+| [src/navigation/CodeNavigator.ts](src/navigation/CodeNavigator.ts) | Open, locate and highlight. Lookup order: document symbols → text search → line number → top of file. |
+| [src/navigation/pathSafety.ts](src/navigation/pathSafety.ts) | Workspace containment checks: traversal, sibling prefixes, URLs, NUL bytes, Windows case |
+| [src/navigation/symbolSearch.ts](src/navigation/symbolSearch.ts) | Language-server-free function range detection (Python and brace languages) and function replacement for diffs |
+| [src/review/ChangeReviewManager.ts](src/review/ChangeReviewManager.ts) | Proposed changes as read-only virtual documents (`visual-agent-change:`) for the diff editor |
+| [src/control/HumanControlManager.ts](src/control/HumanControlManager.ts) | All user gestures → controller calls. Follow behavior, context keys, status bar, approval prompts. |
+| [src/ui/ActivityViewProvider.ts](src/ui/ActivityViewProvider.ts), [media/activity.js](media/activity.js) | Agent Activity webview. Strict CSP plus a nonce, DOM/`textContent` rendering only, validated messages. |
+| [src/ui/viewModel.ts](src/ui/viewModel.ts) | Pure view model (which buttons are enabled, labels, selection) |
+| [src/ui/CommandTreeProvider.ts](src/ui/CommandTreeProvider.ts) | *Agent Commands* tree view |
+| [src/ui/RecordDocumentProvider.ts](src/ui/RecordDocumentProvider.ts) | Read-only command, operation and summary documents |
+| [src/adapters/codex/CodexRpcClient.ts](src/adapters/codex/CodexRpcClient.ts) | JSON-RPC over JSONL stdio. Answers every server request (an error is still an answer), spawns without a shell, waits (bounded) for process exit. |
+| [src/adapters/codex/CodexAppServerAdapter.ts](src/adapters/codex/CodexAppServerAdapter.ts) | Codex streaming adapter: handshake, boundary check, approvals, `turn/interrupt`, `turn/steer` |
+| [src/adapters/codex/CodexItemMapper.ts](src/adapters/codex/CodexItemMapper.ts) | Pure mapping of Codex items to operations (Read/Test/Execute/Edit, paths, inferred function) |
+| [src/adapters/codex/profiles.ts](src/adapters/codex/profiles.ts), [CodexSession.ts](src/adapters/codex/CodexSession.ts), [codexLocator.ts](src/adapters/codex/codexLocator.ts), [protocol.ts](src/adapters/codex/protocol.ts) | Safety profiles, isolation flags, native binary lookup, protocol subset (from `codex app-server generate-ts`) |
+| [src/review/unifiedDiff.ts](src/review/unifiedDiff.ts) | Parses and applies Codex's hunks, for review rendering only |
+
+### v0.3: provider-independent events
+
+```
+ Provider-specific                         Shared
+ Codex notifications ─► CodexEventTranslator ─► NormalizedAgentEvent ─► NormalizedEventApplier ─► OperationSink (controller)
+ Claude Code hooks   ─► (planned translator) ─┘
+ Local agent tools   ─► (planned translator) ─┘
+```
+
+[src/adapters/normalizedEvents.ts](src/adapters/normalizedEvents.ts) defines `operation.announced`, `operation.running`, `operation.completed` and `log`, keyed by the provider's own operation id. [src/adapters/providers.ts](src/adapters/providers.ts) documents what each provider can and can't do. Claude Code and local-agent adapters are **planned, not implemented**: operation facts must come from the agent's tool layer, because model output alone isn't evidence.
+
+| New module | Role |
+|---|---|
+| [src/analysis/changeAnalysis.ts](src/analysis/changeAnalysis.ts) | Changed ranges and affected functions from a real patch (pure) |
+| [src/analysis/staticAnalysis.ts](src/analysis/staticAnalysis.ts) | Call sites, callees, `file:line` extraction from errors (pure, heuristic) |
+| [src/reviewer/OllamaClient.ts](src/reviewer/OllamaClient.ts) | `/api/tags`, `/api/chat` streaming, cancellation, endpoint policy |
+| [src/reviewer/ReviewService.ts](src/reviewer/ReviewService.ts) | Model selection, one request at a time, cache, coalesced streaming updates |
+| [src/reviewer/prompts.ts](src/reviewer/prompts.ts) | Token-bounded, prioritized, redacted prompts |
+| [src/reviewer/ReviewerController.ts](src/reviewer/ReviewerController.ts), [ReviewerViewProvider.ts](src/reviewer/ReviewerViewProvider.ts) | Targets, commands, result documents, panel |
+| [src/export/reviewContext.ts](src/export/reviewContext.ts), [ExportController.ts](src/export/ExportController.ts) | Evidence-labeled Markdown, preview, copy/save |
+| [src/adapters/codex/CodexEventTranslator.ts](src/adapters/codex/CodexEventTranslator.ts) | Codex → normalized events (moved out of the adapter) |
+
+**Performance and resources.** Persistence is debounced (750 ms) instead of serializing the whole history on every event. Very long tasks compact the bulky fields of their oldest finished operations (above 5,000 per task). The timeline renders the latest 300 operations. Webview and reviewer updates are throttled. Reviewer requests are `fetch` streams, so they never block the extension host.
+
+### v0.2 architecture change: pull and streaming adapters
+
+```
+ Mock (pull)    controller ──nextOperation()──► adapter    controller decides, then calls execute()
+ Codex (push)   adapter ──announce/requestDecision──► OperationSink (implemented by the controller)
+                Codex item/started ─► announce (Proposed, enforcement: none)
+                requestApproval    ─► requestDecision (enforcement: agent-approval) ─► accept/decline/cancel
+                outputDelta / item/completed ─► markRunning / complete
+```
+
+The controller still owns every decision, the pending-approval list (now several can be pending at once), Stop, and the audit trail. Streaming adapters never touch the recorder or UI directly. The adapter is chosen per task, so the mock demo and Codex coexist.
+
+### Controller invariants
+
+- Only one task runs at a time. Mock operations are handled one at a time; Codex may have several approvals pending.
+- **Pause** stops new dispatch. It never interrupts the operation that's already running. An approval given while paused is recorded, and the operation runs after **Resume**.
+- **Stop** cancels any pending decision (operation → `Cancelled`, change → `Cancelled`), aborts the running operation through an `AbortSignal`, prevents further dispatch, and ends the task as `Stopped`.
+- **Approve/Reject** succeed only for the operation actually pending. Stale or duplicate decisions return `false`.
+- Terminal statuses (`Completed`, `Failed`, `Rejected`, `Cancelled`) are final. The recorder enforces this.
+
+### Safety properties (mock demo)
+
+- The mock adapter has no filesystem or process access. Every command and result is flagged `simulated: true` and labeled **SIMULATED** in the sidebar, the command view, the documents and the notifications.
+- Proposed edits exist only in memory. The diff's "original" side is a read-only snapshot.
+- Persisted history (`workspaceState`) never contains source code. Change records keep metadata only, and all text fields pass through secret redaction and truncation.
+- Navigation refuses paths outside the workspace (configurable) and handles missing files and functions with a fallback and a message.
+- Webview: `default-src 'none'`, nonce-only scripts, no `innerHTML`, inbound messages shape-checked with an ID pattern and action allow-list.
+
+---
+
+## Tests and validation
+
+```bash
+npm test                  # 93 unit tests (Node test runner; no VS Code, Codex or Ollama needed)
+npm run test:integration  # 19 end-to-end tests in a real Extension Development Host (uses a fake local Ollama)
+npm run test:ollama       # REAL local models (opt-in; uses GPU/RAM): explain, review, cancel per model
+npm run test:ollama:i18n  # REAL local model (opt-in): 中文 / English / bilingual answers, translation, cache, cancel
+npm run test:local-agent  # REAL local coding agent (OpenCode + Ollama) in disposable repos: analysis, edit+approval, test, stop
+node scripts/run-codex-model-select.js   # REAL Codex: one read-only turn with an explicit non-default model + effort
+npm run test:codex        # 5 REAL Codex tests (read-only) in a disposable git repo; uses your Codex quota
+VAW_CODEX_SUITE=edits npm run test:codex   # 2 REAL Codex write tests (approve/reject a patch)
+```
+
+**Codex tests always run in a disposable git repository** (a copy of `demo-workspace/` under the system temp folder, created by [scripts/lib/disposable-repo.js](scripts/lib/disposable-repo.js)). That repository is opened as the workspace of a separate Extension Development Host and deleted afterwards. The runner prints its final `git status` and diff.
+
+Real Codex results (codex-cli 0.154.0, Windows 11):
+
+| Test | Verified |
+|---|---|
+| observe | Real `Read validation.py` recorded as **OBSERVED**; Follow Agent opened it; repo clean |
+| approve-commands: reject | `git log` **intercepted** and rejected; it never ran (no exit code); Codex acknowledged the rejection |
+| approve-commands: approve | Approved `git log` ran; real output (`fixture`) recorded with exit 0 |
+| Stop | `turn/interrupt` with an approval pending; task Stopped in about 0.1 s; pending op Cancelled |
+| Send instruction | `turn/steer` mid-turn; Codex dropped its plan and answered `STEERED` |
+| edits: reject | Patch intercepted and rejected; file byte-for-byte unchanged |
+| edits: approve | Applied file **equals the reviewed proposal**; only `validation.py` modified |
+
+Observed in both approve runs: Codex's final message said it inserted the line "as the first line", but its patch (and our reviewed diff) appended it at the end of the file. The agent's narration was wrong; the recorded diff was right.
+
+Development probe: `node scripts/codex-probe.js` runs one turn in a disposable repo and records the raw protocol trace. It declines all edits; `--approve-commands` accepts commands, which still run read-only.
+
+- **Codex unit tests** use an in-memory fake app-server ([src/test/support/fakeCodex.ts](src/test/support/fakeCodex.ts)) with item shapes copied from real traces. They cover: handshake and thread parameters, the boundary check, observed vs intercepted, accept/decline replies, read-only auto-decline of patches, outside-workspace and `.git` patch refusal, permission/question requests, Stop → `turn/interrupt` + `cancel`, steer with `expectedTurnId` and its failure modes, an app-server crash, and running mock tasks after Codex tasks.
+
+- **Unit tests** ([src/test/](src/test/)) cover controller flows (approve, reject, pause/resume, approval while paused, stop while awaiting approval, stop while paused, stop mid-operation, strict policy, single active task), the recorder (sequencing, immutability, terminal states, redaction, truncation, persistence and reload, no source code persisted, pruning), path safety, function detection against the real fixtures, function replacement (LF and CRLF), and the view model.
+- **Integration tests** ([src/test/integration/index.ts](src/test/integration/index.ts)) run the full demo inside VS Code. They check that Follow opens files, the diff appears, the controller blocks until approval, and no file is modified or dirtied. They also cover clicking an operation (cursor on `def load_data`), Follow-off leaving the editor untouched, pause/resume/stop on the live queue, rendering of the sidebar and record documents, and missing, outside-workspace and missing-function navigation.
+- `test:integration` downloads an isolated VS Code build into `.vscode-test/` (set `VSCODE_EXECUTABLE` to use an installed one). It uses throwaway profile directories.
+
+**Real local models** (`npm run test:ollama`, Ollama 0.40.16, this machine, two runs; times include model loading on first use):
+
+| Model | Explain function | Review change | Cancel mid-stream |
+|---|---|---|---|
+| `qwen3:8b` | done; 7.5 s (35 s cold) | done; 5–7 s; cites `path:line` | stopped ≤ 1 ms after cancel |
+| `gpt-oss:20b` | done; 13–14 s | done; 5–15 s; cites `path:line` | stopped ≤ 3 ms after cancel |
+| `qwen3.8:27b` | done; 25–38 s | done; 52–56 s; cites `path:line` | stopped ≤ 2 ms after cancel |
+
+Found by the real run: with only the function as context, gpt-oss reported `REQUIRED_FIELDS` as "never defined" (it is a module-level constant). Module-level definitions the function references are now included, and the claim no longer appears. In the same review, the model then made another false claim: a `KeyError` for a missing field, which the loop actually reports as `ValidationError`. Model output stays labeled unverified.
+
+**Real Codex** (re-run after the v0.3 refactor): **7/7 passed** (`VAW_CODEX_SUITE=all`). Codex's real patch landed at module level, so no function name was attached.
+
+v0.3 test coverage:
+- **Unit:**
+  - change analysis for Python and TypeScript, including the no-invented-names rule;
+  - the Ollama client and reviewer against a fake HTTP server: discovery, preference, offline, model removed, streaming, cancellation (the server sees the connection closed), caching, and disabled meaning zero requests;
+  - prompts: line numbers, redaction, priority truncation;
+  - static analysis and error locations;
+  - export fidelity;
+  - **observation makes no LLM requests:** the only messages to Codex are the handshake plus the user's single `turn/start`, and the reviewer is never called;
+  - **measured overhead.**
+- **Integration (VS Code host):**
+  - explain function and review change with a fake local Ollama (files untouched, result beside the code);
+  - cancellation;
+  - the export matches source on disk;
+  - changed-line and affected-function navigation;
+  - Ollama offline (the demo still works);
+  - reviewer disabled (zero requests).
+
+Measured (unit test `observerOverhead`, this machine): **6,000 Codex notifications (2,000 commands) processed in about 194–202 ms ≈ 32–34 µs per event**, with **1** persistence write (debounced). The heap grew by about 22 MB for 2,002 operations, each holding about 200 bytes of output.
+
+**v0.4 real results (this machine; disposable git repos):**
+
+| Check | Result |
+|---|---|
+| Local agent, `qwen3:8b`: read-only analysis, then a follow-up in the same session | ✔ read `math.js`, answered (13.2 s); follow-up answered (2.3 s); workspace unchanged |
+| Local agent, `qwen3:8b`: proposed edit | ✔ `Edit math.js › divide() (+3 −0)` **blocked for approval, file byte-for-byte unchanged until approved**; diff shown first |
+| Local agent, `qwen3:8b`: approved `node test.js` | ✔ ran; recorded exit code 0 = independent re-run; output "all tests passed"; only `math.js` changed; `.env` untouched |
+| Local agent, `qwen3:8b`: Stop mid-turn | ✔ session aborted in 44 ms; nothing left running |
+| Local agent, `gpt-oss:20b` / `qwen3.8:27b`: read-only analysis + follow-up | ✔ 22.8 s + 1.8 s / 92.5 s + 7.8 s; workspaces unchanged |
+| Codex: explicit `gpt-5.6-sol` (not the default) + effort `low` | ✔ sent in `thread/start`/`turn/start`, confirmed by Codex, shown in the timeline |
+| Claude Code | v0.4 had fixture-only validation. v0.5 additionally passes a real Pro-subscription read-only task and same-session follow-up. |
+
+An earlier exploratory trace with `qwen3:8b` (approving everything automatically) produced an edit with literal `\n` sequences that broke `math.js`. The recorded diff and the failing `node test.js` output (SyntaxError) made this visible, which is the reason to review a local model's diff before approving it.
+
+### Manual smoke test (≈3 minutes)
+
+1. Press **F5**, open the *Visual Agent* sidebar, and make sure *Live Follow* is checked.
+2. Click **▶ Start demo**. `importer.py` opens with `load_data()` highlighted, then `validation.py` with `validate_samples()`.
+3. Click **⏸ Pause** during steps 1–4. The timeline stops growing. Click **⏵ Resume** and it continues.
+4. At step 5, a diff opens beside the code and the *Approval needed* banner appears. Check that `validation.py` in the Explorer is unchanged.
+5. Click **✓ Approve**. Step 6 shows `python -m pytest …` with **SIMULATED**, exit 0, and *5 passed*. Open it in *Agent Commands*.
+6. Run the demo again and **✕ Reject** (enter a reason). Step 6 now shows exit 1, *3 failed*. The reason appears in the audit trail and the summary.
+7. Run it again and click **⏹ Stop** while approval is pending. The edit becomes *Cancelled*, no test step runs, and the task is *Stopped*.
+8. Uncheck *Live Follow* and start again. The editor doesn't change, but the timeline still updates. Click any past operation to navigate manually.
+10. **Local AI (needs Ollama):** open *Local AI Reviewer*. The model list appears. Put the cursor in `validate_samples` and click **Explain function**; the result streams beside the code. Click **■ Cancel** during a run. Select the demo's Edit operation and click **Review change (local AI)**.
+11. **Export:** select the Edit operation, click **Export…**, then **Entire task**. Check the preview, then click **Copy to Clipboard**.
+9. Run `git status`, or check timestamps, to confirm no file in `demo-workspace/` changed.
+
+---
+
+## Roadmap
+
+Done in v0.2: Codex App Server adapter, with real approvals, interrupt, steering, and observe/intercept labeling.
+Done in v0.3: function-level change tracking, the Local AI Reviewer (Ollama), review-context export, and normalized provider events.
+Done in v0.4: New Agent Task (provider, model, effort, workspace, profile); explicit Codex model selection; local coding agent through OpenCode + Ollama; experimental Claude Code adapter (Agent SDK); multi-turn sessions.
+
+1. **Multi-turn Codex sessions.** Continue a thread with follow-up turns after the first completes (today one task = one turn).
+2. **Claude Code write validation.** Subscription read-only and follow-up are validated; run the edit/command approval flows live before promoting the integration from experimental.
+3. **Hunk-level review.** Partial approval needs an execution path that applies only the accepted hunks. Codex's approval is all-or-nothing per patch, so this would mean declining the patch and applying hunks ourselves.
+4. **Policies.** Path globs (never `.env`), command allow/deny lists, and auto-approve for read-only commands under `untrusted`.
+5. **Cline adapter.** Same streaming interface.
+6. **Export.** Audit trail as JSONL.
+
+## Known limitations
+
+- **Local agent memory:** OpenCode talks to Ollama's OpenAI-compatible endpoint, which can't set `num_ctx`. `visualAgent.local.contextLimit` bounds what OpenCode *sends*, but Ollama still allocates its own default context. Observed: `qwen3:8b` at 40,960 tokens and 11.2 GB, `qwen3.8:27b` at 262,144 tokens and **32.5 GB**. To reduce this, set `OLLAMA_CONTEXT_LENGTH` for your Ollama server yourself; Visual Agent doesn't change Ollama's configuration.
+- **Local agent quality** depends on the model. Small models can produce broken edits or leak reasoning text. Review diffs before approving.
+- **Claude Code:** experimental integration. Subscription read-only and follow-up are live-tested; edit/command permission flows have fixture coverage. Restarted Claude conversations still use saved-context continuation rather than native session restoration.
+- **Codex:** still one turn per task (no follow-up turns yet).
+- **Multi-root:** a task runs in the folder chosen in New Agent Task, and navigation follows that folder.
+- **Reviewer:** model output is unverified. Impact analysis without a language server is a text heuristic (same-named functions and dynamic calls aren't distinguished). Change content for review and export lives in memory for the current session only. Function parsing covers Python and TS/JS; other languages fall back to file and line.
+- **Reviewer:** "beside the code" means a read-only Markdown document in the side editor group. There are no inline annotations.
+- **Codex:** no pause; one native turn per runtime (follow-up in a closed conversation uses labeled saved-context continuation); Codex sessions started elsewhere (VS Code extension, CLI, cloud) are invisible to this extension; under `observe`, reads are observed, not prevented; Windows sandbox behavior depends on your Codex Windows sandbox setup (`[windows] sandbox` in `~/.codex/config.toml`).
+- **Codex output:** `aggregatedOutput` mixes stdout and stderr, and it's labeled as such.
+- **Codex workspace:** New Agent Task uses its selected project folder; legacy demo/entry points can use the first workspace folder.
+
+## Known limitations (v0.1 mock)
+
+- One agent and one task at a time. Multi-root workspaces use the first folder.
+- Proposed-change content lives in memory only, so diffs for past sessions aren't available after a reload. Their metadata and decisions still are.
+- Function lookup uses the language server when one is installed. Otherwise a text heuristic covers Python and C-like languages.
+- The simulated pytest output was derived by reading the fixture code. It wasn't produced by running pytest, because Python wasn't available in the development environment.

@@ -1,0 +1,31 @@
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--vscode-foreground); background: var(--vscode-editor-background); font: var(--vscode-font-size) var(--vscode-font-family); }
+#app { display: grid; grid-template-columns: 240px minmax(0, 1fr); height: 100vh; }
+.sessions { overflow: auto; padding: 12px; border-right: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); }
+h2 { font-size: 16px; margin: 0 0 12px; }
+button { cursor: pointer; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 1px solid transparent; padding: 7px 10px; border-radius: 4px; }
+button:hover { background: var(--vscode-button-hoverBackground); }
+button:disabled { opacity: .5; cursor: default; }
+.session { display: block; width: 100%; margin-top: 10px; text-align: left; color: inherit; background: transparent; overflow-wrap: anywhere; }
+.session:hover, .session.selected { background: var(--vscode-list-hoverBackground); }
+.session.selected { border-color: var(--vscode-focusBorder); }
+small { display: block; color: var(--vscode-descriptionForeground); margin-top: 5px; overflow-wrap: anywhere; }
+main { min-height: 0; display: flex; flex-direction: column; }
+header { padding: 16px 20px; border-bottom: 1px solid var(--vscode-panel-border); }
+.status { display: block; margin-bottom: 8px; color: var(--vscode-textLink-foreground); }
+.status.failed, .error { color: var(--vscode-errorForeground); }
+.messages { flex: 1; min-height: 0; overflow: auto; padding: 20px; }
+.message { margin: 0 auto 16px; padding: 14px; max-width: 1000px; border: 1px solid var(--vscode-panel-border); border-radius: 8px; }
+.message.user { background: var(--vscode-textBlockQuote-background); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }
+.turn { padding: 10px; border-top: 1px solid var(--vscode-panel-border); }
+.turn.failed summary { color: var(--vscode-errorForeground); }
+summary { cursor: pointer; }
+.approval { padding: 14px; border: 1px solid var(--vscode-editorWarning-foreground); margin: 12px 0; }
+.approval button { margin-right: 8px; }
+footer { padding: 12px 20px; border-top: 1px solid var(--vscode-panel-border); }
+textarea { width: 100%; resize: vertical; min-height: 70px; max-height: 250px; font: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); padding: 10px; border-radius: 6px; }
+textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.muted { color: var(--vscode-descriptionForeground); }
+@media(max-width: 700px) { #app { grid-template-columns: 155px minmax(0, 1fr); } header, footer, .messages { padding: 12px; } }

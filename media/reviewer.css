@@ -1,0 +1,18 @@
+.conn::before { content: '●'; margin-right: 5px; }
+.conn-ok::before { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
+.conn-busy::before { color: var(--vscode-charts-yellow); }
+.conn-bad::before { color: var(--vscode-errorForeground); }
+.conn-idle::before { color: var(--vscode-descriptionForeground); }
+.pill.local { color: var(--vscode-charts-green); border: 1px solid var(--vscode-charts-green); }
+.model-row { display: flex; gap: 6px; margin-top: 6px; }
+.model-row select { flex: 1; }
+.error { color: var(--vscode-errorForeground); margin-top: 4px; }
+.warn { color: var(--vscode-editorWarning-foreground); margin: 2px 0 4px; }
+.notice { padding: 8px 0; }
+.result .output { max-height: 420px; white-space: pre-wrap; }
+.result .thinking { max-height: 200px; opacity: 0.8; }
+.link {
+  display: block; width: 100%; text-align: left; margin: 2px 0; padding: 2px 4px; cursor: pointer;
+  font-size: 12px; color: var(--vscode-textLink-foreground); background: transparent; border: none;
+}
+.link:hover { text-decoration: underline; }

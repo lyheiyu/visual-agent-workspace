@@ -1,0 +1,632 @@
+{
+  "name": "visual-agent-workspace",
+  "displayName": "Visual Agent Workspace",
+  "description": "Watch AI coding agents work in real time (files, functions, diffs, commands) with approvals, plus an optional local Ollama reviewer.",
+  "version": "0.5.0",
+  "publisher": "visual-agent-workspace",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "visualAgent",
+          "title": "%container.title%",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "visualAgent": [
+        {
+          "type": "webview",
+          "id": "visualAgent.activity",
+          "name": "%view.activity%"
+        },
+        {
+          "id": "visualAgent.commands",
+          "name": "%view.commands%"
+        },
+        {
+          "type": "webview",
+          "id": "visualAgent.reviewer",
+          "name": "%view.reviewer%"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "visualAgent.openConversations",
+        "title": "会话 / Conversations",
+        "category": "Visual Agent",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "visualAgent.explainInConversation",
+        "title": "在当前会话解释函数 / Explain Function in Conversation",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.startDemo",
+        "title": "%cmd.startDemo%",
+        "category": "Visual Agent",
+        "icon": "$(play)"
+      },
+      {
+        "command": "visualAgent.newAgentTask",
+        "title": "%cmd.newAgentTask%",
+        "category": "Visual Agent",
+        "icon": "$(add)"
+      },
+      {
+        "command": "visualAgent.endSession",
+        "title": "%cmd.endSession%",
+        "category": "Visual Agent",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "visualAgent.startCodex",
+        "title": "%cmd.startCodex%",
+        "category": "Visual Agent",
+        "icon": "$(hubot)"
+      },
+      {
+        "command": "visualAgent.steer",
+        "title": "%cmd.steer%",
+        "category": "Visual Agent",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "visualAgent.pause",
+        "title": "%cmd.pause%",
+        "category": "Visual Agent",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "visualAgent.resume",
+        "title": "%cmd.resume%",
+        "category": "Visual Agent",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "visualAgent.stop",
+        "title": "%cmd.stop%",
+        "category": "Visual Agent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "visualAgent.approve",
+        "title": "%cmd.approve%",
+        "category": "Visual Agent",
+        "icon": "$(check)"
+      },
+      {
+        "command": "visualAgent.reject",
+        "title": "%cmd.reject%",
+        "category": "Visual Agent",
+        "icon": "$(close)"
+      },
+      {
+        "command": "visualAgent.review",
+        "title": "%cmd.review%",
+        "category": "Visual Agent",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "visualAgent.followOn",
+        "title": "%cmd.followOn%",
+        "category": "Visual Agent",
+        "icon": "$(eye-closed)"
+      },
+      {
+        "command": "visualAgent.followOff",
+        "title": "%cmd.followOff%",
+        "category": "Visual Agent",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "visualAgent.toggleFollow",
+        "title": "%cmd.toggleFollow%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.revealOperation",
+        "title": "%cmd.revealOperation%",
+        "category": "Visual Agent",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "visualAgent.showCommandOutput",
+        "title": "%cmd.showCommandOutput%",
+        "category": "Visual Agent",
+        "icon": "$(output)"
+      },
+      {
+        "command": "visualAgent.showSummary",
+        "title": "%cmd.showSummary%",
+        "category": "Visual Agent",
+        "icon": "$(book)"
+      },
+      {
+        "command": "visualAgent.clearHistory",
+        "title": "%cmd.clearHistory%",
+        "category": "Visual Agent",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "visualAgent.reviewer.explainFunction",
+        "title": "%cmd.reviewer.explainFunction%",
+        "category": "Visual Agent",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "visualAgent.reviewer.reviewChange",
+        "title": "%cmd.reviewer.reviewChange%",
+        "category": "Visual Agent",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "visualAgent.reviewer.impactAnalysis",
+        "title": "%cmd.reviewer.impactAnalysis%",
+        "category": "Visual Agent",
+        "icon": "$(references)"
+      },
+      {
+        "command": "visualAgent.reviewer.explainError",
+        "title": "%cmd.reviewer.explainError%",
+        "category": "Visual Agent",
+        "icon": "$(bug)"
+      },
+      {
+        "command": "visualAgent.reviewer.cancel",
+        "title": "%cmd.reviewer.cancel%",
+        "category": "Visual Agent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "visualAgent.reviewer.refreshModels",
+        "title": "%cmd.reviewer.refreshModels%",
+        "category": "Visual Agent",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "visualAgent.reviewer.selectModel",
+        "title": "%cmd.reviewer.selectModel%",
+        "category": "Visual Agent",
+        "icon": "$(chip)"
+      },
+      {
+        "command": "visualAgent.reviewer.copyResult",
+        "title": "%cmd.reviewer.copyResult%",
+        "category": "Visual Agent",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "visualAgent.reviewer.exportResult",
+        "title": "%cmd.reviewer.exportResult%",
+        "category": "Visual Agent",
+        "icon": "$(save)"
+      },
+      {
+        "command": "visualAgent.reviewer.openResult",
+        "title": "%cmd.reviewer.openResult%",
+        "category": "Visual Agent",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "visualAgent.exportReviewContext",
+        "title": "%cmd.exportReviewContext%",
+        "category": "Visual Agent",
+        "icon": "$(export)"
+      },
+      {
+        "command": "visualAgent.selectLanguage",
+        "title": "%cmd.selectLanguage%",
+        "category": "Visual Agent",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "visualAgent.reviewer.translateResult",
+        "title": "%cmd.translateResult%",
+        "category": "Visual Agent",
+        "icon": "$(globe)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "visualAgent.newAgentTask",
+          "when": "view == visualAgent.activity && !visualAgent.taskActive",
+          "group": "navigation@0"
+        },
+        {
+          "command": "visualAgent.startDemo",
+          "when": "view == visualAgent.activity && !visualAgent.taskActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "visualAgent.pause",
+          "when": "view == visualAgent.activity && visualAgent.taskActive && !visualAgent.paused && visualAgent.canPause",
+          "group": "navigation@2"
+        },
+        {
+          "command": "visualAgent.resume",
+          "when": "view == visualAgent.activity && visualAgent.taskActive && visualAgent.paused",
+          "group": "navigation@2"
+        },
+        {
+          "command": "visualAgent.stop",
+          "when": "view == visualAgent.activity && visualAgent.taskActive",
+          "group": "navigation@3"
+        },
+        {
+          "command": "visualAgent.followOn",
+          "when": "view == visualAgent.activity && !visualAgent.followAgent",
+          "group": "navigation@4"
+        },
+        {
+          "command": "visualAgent.followOff",
+          "when": "view == visualAgent.activity && visualAgent.followAgent",
+          "group": "navigation@4"
+        },
+        {
+          "command": "visualAgent.showSummary",
+          "when": "view == visualAgent.activity",
+          "group": "overflow@1"
+        },
+        {
+          "command": "visualAgent.clearHistory",
+          "when": "view == visualAgent.activity && !visualAgent.taskActive",
+          "group": "overflow@2"
+        },
+        {
+          "command": "visualAgent.steer",
+          "when": "view == visualAgent.activity && visualAgent.canSteer",
+          "group": "navigation@3"
+        },
+        {
+          "command": "visualAgent.reviewer.refreshModels",
+          "when": "view == visualAgent.reviewer && visualAgent.reviewerEnabled",
+          "group": "navigation@1"
+        },
+        {
+          "command": "visualAgent.reviewer.cancel",
+          "when": "view == visualAgent.reviewer && visualAgent.reviewerEnabled",
+          "group": "navigation@2"
+        },
+        {
+          "command": "visualAgent.exportReviewContext",
+          "when": "view == visualAgent.activity",
+          "group": "overflow@0"
+        },
+        {
+          "command": "visualAgent.selectLanguage",
+          "when": "view == visualAgent.activity || view == visualAgent.reviewer",
+          "group": "overflow@9"
+        },
+        {
+          "command": "visualAgent.endSession",
+          "when": "view == visualAgent.activity && visualAgent.canEndSession",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "visualAgent.revealOperation",
+          "when": "view == visualAgent.commands && viewItem == vawCommand",
+          "group": "inline"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "visualAgent.pause",
+          "when": "visualAgent.taskActive && !visualAgent.paused && visualAgent.canPause"
+        },
+        {
+          "command": "visualAgent.resume",
+          "when": "visualAgent.taskActive && visualAgent.paused"
+        },
+        {
+          "command": "visualAgent.stop",
+          "when": "visualAgent.taskActive"
+        },
+        {
+          "command": "visualAgent.approve",
+          "when": "visualAgent.awaitingApproval"
+        },
+        {
+          "command": "visualAgent.reject",
+          "when": "visualAgent.awaitingApproval"
+        },
+        {
+          "command": "visualAgent.followOn",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.followOff",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.revealOperation",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.showCommandOutput",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.steer",
+          "when": "visualAgent.canSteer"
+        },
+        {
+          "command": "visualAgent.reviewer.explainFunction",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.reviewChange",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.impactAnalysis",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.explainError",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.cancel",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.refreshModels",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.selectModel",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.copyResult",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.exportResult",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.openResult",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.translateResult",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.endSession",
+          "when": "visualAgent.canEndSession"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "visualAgent.reviewer.explainFunction",
+          "when": "visualAgent.reviewerEnabled && resourceScheme == file",
+          "group": "visualAgent@1"
+        },
+        {
+          "command": "visualAgent.reviewer.reviewChange",
+          "when": "visualAgent.reviewerEnabled && resourceScheme == file",
+          "group": "visualAgent@2"
+        },
+        {
+          "command": "visualAgent.reviewer.impactAnalysis",
+          "when": "visualAgent.reviewerEnabled && resourceScheme == file",
+          "group": "visualAgent@3"
+        },
+        {
+          "command": "visualAgent.exportReviewContext",
+          "when": "resourceScheme == file",
+          "group": "visualAgent@4"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Visual Agent Workspace",
+      "properties": {
+        "visualAgent.followAgentByDefault": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.followAgentByDefault%"
+        },
+        "visualAgent.stepDelayMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "%config.stepDelayMs%"
+        },
+        "visualAgent.requireApprovalForCommands": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.requireApprovalForCommands%"
+        },
+        "visualAgent.allowNavigationOutsideWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.allowNavigationOutsideWorkspace%"
+        },
+        "visualAgent.codex.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "%config.codex.executablePath%"
+        },
+        "visualAgent.claude.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Official Claude Code executable. Auto-detects the VS Code extension's native binary, then local installations."
+        },
+        "visualAgent.claude.authMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "subscription",
+            "api"
+          ],
+          "default": "auto",
+          "description": "auto preserves API/cloud environment auth when configured, otherwise uses official subscription login. subscription uses only official Claude Code login and never falls back to API billing."
+        },
+        "visualAgent.codex.model": {
+          "type": "string",
+          "default": "",
+          "description": "%config.codex.model%"
+        },
+        "visualAgent.codex.defaultProfile": {
+          "type": "string",
+          "enum": [
+            "observe",
+            "approve-commands",
+            "approve-edits"
+          ],
+          "enumDescriptions": [
+            "%config.codex.defaultProfile.0%",
+            "%config.codex.defaultProfile.1%",
+            "%config.codex.defaultProfile.2%"
+          ],
+          "default": "observe",
+          "description": "%config.codex.defaultProfile%"
+        },
+        "visualAgent.codex.maxTurnMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 240,
+          "description": "%config.codex.maxTurnMinutes%"
+        },
+        "visualAgent.reviewer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.reviewer.enabled%"
+        },
+        "visualAgent.reviewer.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "%config.reviewer.endpoint%"
+        },
+        "visualAgent.reviewer.allowRemoteEndpoint": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.reviewer.allowRemoteEndpoint%"
+        },
+        "visualAgent.reviewer.model": {
+          "type": "string",
+          "default": "",
+          "description": "%config.reviewer.model%"
+        },
+        "visualAgent.reviewer.thinking": {
+          "type": "string",
+          "enum": [
+            "off",
+            "low",
+            "on"
+          ],
+          "default": "off",
+          "description": "%config.reviewer.thinking%"
+        },
+        "visualAgent.reviewer.contextWindow": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 2048,
+          "maximum": 131072,
+          "description": "%config.reviewer.contextWindow%"
+        },
+        "visualAgent.reviewer.maxContextChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 2000,
+          "maximum": 200000,
+          "description": "%config.reviewer.maxContextChars%"
+        },
+        "visualAgent.language": {
+          "type": "string",
+          "enum": [
+            "zh-CN",
+            "en",
+            "bilingual"
+          ],
+          "enumDescriptions": [
+            "中文 (Simplified Chinese)",
+            "English",
+            "中英双语 (Bilingual)"
+          ],
+          "default": "zh-CN",
+          "description": "%config.language%"
+        },
+        "visualAgent.local.opencodePath": {
+          "type": "string",
+          "default": "",
+          "description": "%config.local.opencodePath%"
+        },
+        "visualAgent.local.ollamaEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "%config.local.ollamaEndpoint%"
+        },
+        "visualAgent.local.contextLimit": {
+          "type": "number",
+          "default": 32768,
+          "minimum": 4096,
+          "maximum": 262144,
+          "description": "%config.local.contextLimit%"
+        },
+        "visualAgent.local.outputLimit": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 1024,
+          "maximum": 65536,
+          "description": "%config.local.outputLimit%"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "dev:prepare": "npm run compile && node scripts/prepare-dev-workspace.js",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node --test \"out/test/*.test.js\"",
+    "test:integration": "npm run compile && node scripts/run-integration.js",
+    "test:codex": "npm run compile && node scripts/run-codex-integration.js",
+    "test:ollama": "npm run compile && node scripts/run-ollama-real.js",
+    "test:ollama:i18n": "npm run compile && node scripts/run-ollama-i18n.js",
+    "test:local-agent": "npm run compile && node scripts/run-local-agent-real.js",
+    "test:local-conversation": "npm run compile && node scripts/run-local-conversation-real.js",
+    "test:claude-subscription": "npm run compile && node scripts/run-claude-subscription-real.js",
+    "vscode:prepublish": "npm run compile",
+    "package:vsix": "node scripts/package-vsix.js",
+    "verify:vsix": "node scripts/verify-vsix.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "~1.85.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "4.1.1",
+    "opencode-ai": "1.19.6",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.326"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "minimatch": "11.0.1"
+    }
+  }
+}

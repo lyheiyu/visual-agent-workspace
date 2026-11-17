@@ -1,0 +1,28 @@
+name: Check and package extension
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=optional
+      - run: npm test
+      - run: npm run package:vsix
+      - run: npm run verify:vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visual-agent-workspace-vsix
+          path: |
+            artifacts/*.vsix
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
