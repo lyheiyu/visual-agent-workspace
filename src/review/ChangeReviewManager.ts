@@ -91,7 +91,17 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
     return side === 'original' ? p.original : p.proposed;
   }
 
-  clear(): void {
+  /** Read-only 'original' side of a change (the snapshot its diff was computed against). */
+  originalUri(changeId: string, filePath: string): vscode.Uri {
+    return this.uriFor(changeId, 'original', path.basename(filePath));
+  }
+
+  /** Register an already-applied change (e.g. the user's edited version) so its diff can be shown. */
+  register(change: ProposedChangeContent, original: string, proposed: string): void {
+    this.prepared.set(change.changeId, Promise.resolve({ change, original, proposed }));
+  }
+
+    clear(): void {
     this.prepared.clear();
   }
 

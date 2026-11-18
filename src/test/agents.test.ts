@@ -13,6 +13,7 @@ import { DESTRUCTIVE_COMMAND, mapToolCall } from '../agents/toolMapping';
 import { discoverOllamaCodingModels } from '../agents/providers';
 import { ReviewService } from '../reviewer/ReviewService';
 import { FakeOpenCode } from './support/fakeOpenCode';
+import { localWorkflowPrompt } from '../agents/opencode/localWorkflow';
 
 const MATH = `// Small math helpers.
 
@@ -159,6 +160,12 @@ test('local agent: read-only analysis — observed reads, answer recorded, sessi
   assert.ok(fake.requests.every((r) => !r.route.includes('/prompt_async') || r.route.includes(fake.sessionId)));
   const body = fake.requests.find((r) => r.route.endsWith('/prompt_async'))!.body;
   assert.deepEqual(body.model, { providerID: 'ollama', modelID: 'qwen3:8b' });
+  assert.equal(body.system, localWorkflowPrompt('read-only', 'plan-files', root));
+  assert.ok(body.system.includes(JSON.stringify(root)), 'actual selected workspace is supplied to the model');
+  const prompts = fake.requests.filter((r) => r.route.endsWith('/prompt_async'));
+  assert.equal(prompts[1].body.system, body.system, 'follow-up retains workflow without an extra planning request');
+  assert.equal(body.parts[0].text, 'Explain divide()');
+  assert.equal(prompts[1].body.parts[0].text, 'Any edge cases?');
   assert.equal(recorder.getTask(taskId)!.status, 'Completed');
   assert.deepEqual(recorder.getTask(taskId)!.messages?.map(({ role, text }) => ({ role, text })), [
     { role: 'user', text: 'Explain divide()' },

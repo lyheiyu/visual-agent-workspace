@@ -89,6 +89,15 @@ async function edit(model) {
     adapter,
     repo.dir,
   );
+  // Live preview of a change still being generated (display only).
+  let previews = 0;
+  let previewMax = 0;
+  const previewSub = controller.onDidChangeState((x) => {
+    if (x.preview) {
+      previews++;
+      previewMax = Math.max(previewMax, x.preview.characters);
+    }
+  });
   let interceptedUnchanged = true;
   let editSeen = false;
   let testOp;
@@ -112,6 +121,8 @@ async function edit(model) {
       // let the agent finish its turn
     }
   }
+  previewSub.dispose();
+  console.log(`     live preview updates: ${previews} (max ${previewMax} chars)`);
   const editOps = recorder.getOperations(taskId).filter((o) => o.operationType === 'Edit');
   check(`[${model}] agent proposed an edit that waited for approval`, editSeen && editOps.some((o) => o.enforcement === 'agent-approval'));
   check(`[${model}] file unchanged while approval was pending (real interception)`, editSeen && interceptedUnchanged);

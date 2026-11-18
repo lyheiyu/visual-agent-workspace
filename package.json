@@ -4,9 +4,14 @@
   "description": "Watch AI coding agents work in real time (files, functions, diffs, commands) with approvals, plus an optional local Ollama reviewer.",
   "version": "0.5.0",
   "publisher": "visual-agent-workspace",
-  "repository": { "type": "git", "url": "https://github.com/lyheiyu/visual-agent-workspace.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lyheiyu/visual-agent-workspace.git"
+  },
   "homepage": "https://github.com/lyheiyu/visual-agent-workspace#readme",
-  "bugs": { "url": "https://github.com/lyheiyu/visual-agent-workspace/issues" },
+  "bugs": {
+    "url": "https://github.com/lyheiyu/visual-agent-workspace/issues"
+  },
   "license": "MIT",
   "private": true,
   "engines": {
@@ -241,6 +246,57 @@
         "title": "%cmd.translateResult%",
         "category": "Visual Agent",
         "icon": "$(globe)"
+      },
+      {
+        "command": "visualAgent.openReference",
+        "title": "%cmd.openReference%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.openReferenceToSide",
+        "title": "%cmd.openReferenceToSide%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.copyReferencePath",
+        "title": "%cmd.copyReferencePath%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.explainCodeInDetail",
+        "title": "%cmd.explainCodeInDetail%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.explainReference",
+        "title": "%cmd.explainCodeInDetail%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.explain.cancel",
+        "title": "%cmd.explainCancel%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.reviewer.explainCommand",
+        "title": "%cmd.reviewer.explainCommand%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.explainFile",
+        "title": "%cmd.explainFile%",
+        "category": "Visual Agent",
+        "icon": "$(book)"
+      },
+      {
+        "command": "visualAgent.checkMyChanges",
+        "title": "%cmd.checkMyChanges%",
+        "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.continueFromMyChanges",
+        "title": "%cmd.continueFromMyChanges%",
+        "category": "Visual Agent"
       }
     ],
     "menus": {
@@ -416,9 +472,51 @@
         {
           "command": "visualAgent.endSession",
           "when": "visualAgent.canEndSession"
+        },
+        {
+          "command": "visualAgent.openReference",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.openReferenceToSide",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.copyReferencePath",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.explainCodeInDetail",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.explainReference",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.explain.cancel",
+          "when": "visualAgent.reviewerEnabled"
+        },
+        {
+          "command": "visualAgent.reviewer.explainCommand",
+          "when": "false"
+        },
+        {
+          "command": "visualAgent.explainFile",
+          "when": "visualAgent.reviewerEnabled"
         }
       ],
       "editor/context": [
+        {
+          "command": "visualAgent.explainFile",
+          "when": "visualAgent.reviewerEnabled && resourceScheme == file",
+          "group": "visualAgent@0"
+        },
+        {
+          "command": "visualAgent.explainCodeInDetail",
+          "when": "visualAgent.reviewerEnabled && (resourceScheme == file || resourceScheme == untitled)",
+          "group": "visualAgent@1"
+        },
         {
           "command": "visualAgent.reviewer.explainFunction",
           "when": "visualAgent.reviewerEnabled && resourceScheme == file",
@@ -438,6 +536,42 @@
           "command": "visualAgent.exportReviewContext",
           "when": "resourceScheme == file",
           "group": "visualAgent@4"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "visualAgent.openReference",
+          "when": "webviewSection == 'codeRef'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "visualAgent.openReferenceToSide",
+          "when": "webviewSection == 'codeRef'",
+          "group": "navigation@2"
+        },
+        {
+          "command": "visualAgent.copyReferencePath",
+          "when": "webviewSection == 'codeRef'",
+          "group": "9_cutcopypaste@1"
+        },
+        {
+          "command": "visualAgent.explainReference",
+          "when": "webviewSection == 'codeRef' && visualAgent.reviewerEnabled && !refSelf",
+          "group": "navigation@3"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "visualAgent.explainFile",
+          "when": "visualAgent.reviewerEnabled && !explorerResourceIsFolder",
+          "group": "visualAgent@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "visualAgent.explainFile",
+          "when": "visualAgent.reviewerEnabled && resourceScheme == file",
+          "group": "navigation@90"
         }
       ]
     },
@@ -557,6 +691,13 @@
           "maximum": 200000,
           "description": "%config.reviewer.maxContextChars%"
         },
+        "visualAgent.reviewer.explainMaxParts": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "%config.reviewer.explainMaxParts%"
+        },
         "visualAgent.language": {
           "type": "string",
           "enum": [
@@ -589,6 +730,15 @@
           "maximum": 262144,
           "description": "%config.local.contextLimit%"
         },
+        "visualAgent.local.workflow": {
+          "type": "string",
+          "enum": [
+            "plan-files",
+            "direct"
+          ],
+          "default": "plan-files",
+          "description": "Local coding workflow: plan-files requests a short overall plan then sequential file edits and validation. direct keeps only basic tool/result instructions. Existing approvals and read-only permissions remain enforced."
+        },
         "visualAgent.local.outputLimit": {
           "type": "number",
           "default": 8192,
@@ -606,9 +756,11 @@
     "pretest": "npm run compile",
     "test": "node --test \"out/test/*.test.js\"",
     "test:integration": "npm run compile && node scripts/run-integration.js",
+    "test:acceptance": "npm run compile && node scripts/run-acceptance.js",
     "test:codex": "npm run compile && node scripts/run-codex-integration.js",
     "test:ollama": "npm run compile && node scripts/run-ollama-real.js",
     "test:ollama:i18n": "npm run compile && node scripts/run-ollama-i18n.js",
+    "test:ollama:explain": "npm run compile && node scripts/run-ollama-explain.js",
     "test:local-agent": "npm run compile && node scripts/run-local-agent-real.js",
     "test:local-conversation": "npm run compile && node scripts/run-local-conversation-real.js",
     "test:claude-subscription": "npm run compile && node scripts/run-claude-subscription-real.js",

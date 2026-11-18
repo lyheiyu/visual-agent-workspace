@@ -7,7 +7,8 @@ import { FunctionRange, guessLanguage, innermost, listFunctionRanges } from '../
 import { extractErrorLocations, findCallees, findCallSites, referencedModuleDefinitions, SourceFile } from '../analysis/staticAnalysis';
 import { AgentOperation } from '../types/events';
 import { ReviewRequest, ReviewResult, ReviewService } from './ReviewService';
-import { CodeBlock, explainErrorPrompt, explainFunctionPrompt, impactPrompt, reviewChangePrompt } from './prompts';
+import { CodeBlock, explainCommandPrompt, explainErrorPrompt, explainFunctionPrompt, impactPrompt, reviewChangePrompt } from './prompts';
+import { describeCommand } from '../analysis/commandInfo';
 import { redactSecrets } from '../recorder/redaction';
 import { localizeError, normalizeLanguage, t, UiLanguage } from '../i18n/i18n';
 import { TranslationTarget } from './ReviewService';
@@ -66,6 +67,7 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     reg('visualAgent.reviewer.reviewChange', (opId?: string) => this.guard(() => this.reviewChange(typeof opId === 'string' ? opId : undefined)));
     reg('visualAgent.reviewer.impactAnalysis', () => this.guard(() => this.impactAnalysis()));
     reg('visualAgent.reviewer.explainError', (opId?: string) => this.guard(() => this.explainError(typeof opId === 'string' ? opId : undefined)));
+    reg('visualAgent.reviewer.explainCommand', (opId?: string) => this.guard(() => this.explainCommand(typeof opId === 'string' ? opId : undefined)));
     reg('visualAgent.reviewer.cancel', () => this.service.cancel());
     reg('visualAgent.reviewer.refreshModels', () => this.service.refreshModels());
     reg('visualAgent.reviewer.selectModel', () => this.pickModel());
@@ -220,6 +222,33 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     });
   }
 
+  /** On-demand explanation of a recorded command (purpose, read/write scope, risks). Nothing is executed. */
+  async explainCommand(operationId?: string): Promise<ReviewResult | undefined> {
+    const op = this.recorder.getOperation(operationId ?? this.selectedOperationId() ?? '');
+    if (!op?.command) {
+      throw new Error('Select a command operation in Agent Activity first.');
+    }
+    const facts = describeCommand(op.command.command);
+    const built = explainCommandPrompt(
+      {
+        command: op.command.command,
+        cwd: op.command.workingDirectory,
+        status: op.status,
+        exitCode: op.command.exitCode,
+        output: [op.command.stdout, op.command.stderr].filter(Boolean).join('\n') || undefined,
+        facts,
+      },
+      this.budget(),
+      this.responseLanguage(),
+    );
+    return this.execute({
+      kind: 'command',
+      title: `Explain command #${op.sequenceNumber}: ${truncate(facts.summary, 60)}`,
+      subject: { operationId: op.operationId, taskId: op.taskId },
+      ...built,
+    });
+  }
+
   // ------------------------------------------------------- result display
 
   provideTextDocumentContent(uri: vscode.Uri): string {
@@ -322,6 +351,22 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
   /** Called before each local review; may veto loading another model. */
   setInferenceGuard(guard: (model: string) => Promise<boolean>): void {
     this.inferenceGuard = guard;
+  }
+
+  /**
+   * One local request without opening the result document (used by Explain Code in Detail,
+   * which shows its own panel). Same model, guard, cancellation and read-only guarantees.
+   */
+  async runDirect(req: ReviewRequest): Promise<ReviewResult> {
+    req.language ??= this.responseLanguage();
+    if (this.service.getState().connection !== 'connected') await this.service.refreshModels();
+    const model = this.service.getState().selectedModel;
+    if (model && this.inferenceGuard && !(await this.inferenceGuard(model))) {
+      throw new Error('Cancelled: the review would load another local model.');
+    }
+    const result = await this.service.run(req);
+    this.log.appendLine(`[reviewer] ${result.kind} with ${result.model}: ${result.status}${result.cached ? ' (cached)' : ''} in ${result.durationMs ?? 0} ms`);
+    return result;
   }
 
   private async execute(req: ReviewRequest): Promise<ReviewResult> {

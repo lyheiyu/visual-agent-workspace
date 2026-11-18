@@ -190,6 +190,7 @@ function httpConnection(
     async request<T>(method: string, route: string, body?: unknown): Promise<T> {
       const r = await fetch(q(route), {
         method,
+        signal: AbortSignal.timeout(15000),
         headers: body === undefined ? undefined : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
       });

@@ -271,6 +271,7 @@ export class AgentLauncher {
       const configured = Math.max(4096, this.cfg().get<number>('local.contextLimit', 32768));
       return new OpenCodeAdapter({
         resumeSessionId,
+        workflow: this.cfg().get<'plan-files' | 'direct'>('local.workflow', 'plan-files'),
         connector: startOpenCodeServer,
         launch: {
           executable: exe,

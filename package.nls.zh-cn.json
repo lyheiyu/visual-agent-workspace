@@ -56,5 +56,15 @@
   "config.local.opencodePath": "原生 OpenCode 可执行文件路径（opencode / opencode.exe）。留空则自动检测（扩展内置、全局 npm 的 opencode-ai、PATH）。不接受 shell 脚本。",
   "config.local.ollamaEndpoint": "本地编码代理使用的 Ollama 地址。留空则使用本地 AI 审查的地址。只配置本地推理。",
   "config.local.contextLimit": "本地代理可使用的上下文大小（token），不超过模型自身上限。Ollama 会为加载的上下文分配内存。",
-  "config.local.outputLimit": "本地代理每次回复的最大输出 token 数。"
+  "config.local.outputLimit": "本地代理每次回复的最大输出 token 数。",
+  "cmd.openReference": "打开引用",
+  "cmd.openReferenceToSide": "在侧边打开引用",
+  "cmd.copyReferencePath": "复制引用",
+  "cmd.explainCodeInDetail": "详细解释选中代码 / 函数（本地 AI）…",
+  "cmd.explainCancel": "取消代码解释",
+  "config.reviewer.explainMaxParts": "详细解释代码：大文件或大类最多拆分的部分数（每部分一次本地请求）。超出部分会明确标为未分析。",
+  "cmd.reviewer.explainCommand": "解释命令（本地 AI，不执行）",
+  "cmd.explainFile": "解释此文件（本地 AI）",
+  "cmd.checkMyChanges": "检查我的修改（询问代理）",
+  "cmd.continueFromMyChanges": "基于我的修改继续"
 }

@@ -113,3 +113,33 @@ export function referencedModuleDefinitions(fileText: string, code: string, lang
   }
   return out;
 }
+
+/**
+ * Files that import `relPath` (Python import/from, JS/TS import/require of a
+ * relative path ending in the module name). Text heuristic: dynamic imports
+ * and re-exports through other names are not found.
+ */
+export function findImporters(relPath: string, files: SourceFile[], max = 30): Array<{ filePath: string; line: number; snippet: string }> {
+  const norm = relPath.replace(/\\/g, '/');
+  const base = norm.split('/').pop() ?? norm;
+  const mod = base.replace(/\.[^.]+$/, '');
+  if (!/^[\w$-]+$/.test(mod)) return [];
+  const isPy = /\.pyi?$/i.test(base);
+  const esc = mod.replace(/[$-]/g, (c) => '\\' + c);
+  const py = new RegExp(`^\\s*(?:from\\s+[\\w.]*\\b${esc}\\b\\s+import\\b|import\\s+(?:[\\w.]+\\.)?${esc}\\b|from\\s+\\.+\\s+import\\s+[\\w\\s,]*\\b${esc}\\b)`);
+  const js = new RegExp(`(?:\\bfrom\\s*|\\brequire\\s*\\(\\s*|\\bimport\\s*\\(\\s*|^\\s*import\\s+)['"](\\.{1,2}/(?:[^'"]*/)?${esc}(?:\\.[cm]?[jt]sx?)?|\\.{1,2}/(?:[^'"]*/)?${esc}/index)['"]`);
+  const out: Array<{ filePath: string; line: number; snippet: string }> = [];
+  for (const f of files) {
+    if (f.filePath.replace(/\\/g, '/') === norm) continue;
+    const fIsPy = /\.pyi?$/i.test(f.filePath);
+    if (fIsPy !== isPy) continue;
+    const lines = f.text.split(/\r?\n/);
+    for (let i = 0; i < lines.length && out.length < max; i++) {
+      if ((isPy ? py : js).test(lines[i])) {
+        out.push({ filePath: f.filePath, line: i + 1, snippet: lines[i].trim().slice(0, 200) });
+        break;
+      }
+    }
+  }
+  return out;
+}

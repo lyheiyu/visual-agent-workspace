@@ -9,6 +9,7 @@ const ACTIONS: Record<string, string> = {
   review: 'visualAgent.reviewer.reviewChange',
   impact: 'visualAgent.reviewer.impactAnalysis',
   error: 'visualAgent.reviewer.explainError',
+  detail: 'visualAgent.explainCodeInDetail',
 };
 
 /**

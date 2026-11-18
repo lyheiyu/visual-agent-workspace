@@ -277,3 +277,46 @@ test('mock demo still works after Codex tasks (adapter is per task)', async () =
   assert.equal(recorder.getTask(demo)!.status, 'Completed');
   assert.ok(recorder.getOperations(demo).every((o) => o.enforcement === 'controller'));
 });
+
+test('declined Codex proposals: the reason / feedback reaches Codex via turn/steer, and delivery is recorded', async () => {
+  const replies: unknown[] = [];
+  const { server, recorder, controller, adapter } = setup('approve-edits', async (s) => {
+    s.itemStarted(fileChangeItem(path.join(ROOT, 'validation.py'), { id: 'p-1' }));
+    replies.push((await s.request('item/fileChange/requestApproval', { threadId: s.threadId, turnId: s.turnId, itemId: 'p-1' })).result);
+    await tick(40); // the turn is still active while the reason is sent
+    s.itemCompleted(fileChangeItem(path.join(ROOT, 'validation.py'), { id: 'p-1', status: 'declined' }));
+    s.completeTurn('completed');
+  });
+  const taskId = controller.start('t', adapter);
+  const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
+  controller.reject(snap.awaitingApprovalFor!, 'Regenerate requested by the user. Feedback: keep the public signature.');
+  await controller.whenIdle();
+  assert.deepEqual(replies, [{ decision: 'decline' }], 'the approval reply itself has no message field');
+  const steer = server.received.find((m) => m.method === 'turn/steer')!;
+  assert.ok(steer, 'reason sent as a steer');
+  assert.equal(steer.params.expectedTurnId, 'turn-1');
+  assert.match(steer.params.input[0].text, /declined your proposed file change[\s\S]*Feedback: keep the public signature/);
+  const delivered = recorder.getOperations(taskId).find((o) => o.operationType === 'Instruct' && /decline reason/.test(o.description))!;
+  assert.equal(delivered.status, 'Completed');
+  assert.match(delivered.resultSummary!, /Delivered/);
+});
+
+test('declined Codex proposal after the turn ended: recorded as NOT delivered (never silently dropped)', async () => {
+  const { server, recorder, controller, adapter } = setup('approve-commands', async (s) => {
+    s.itemStarted(commandItem(ROOT, { id: 'exec-x', command: 'rm -rf build' }));
+    await s.request('item/commandExecution/requestApproval', { threadId: s.threadId, turnId: s.turnId, itemId: 'exec-x' });
+    s.completeTurn('completed');
+  });
+  server.handlers['turn/steer'] = () => {
+    throw Object.assign(new Error('no active turn'), { code: -32600 });
+  };
+  const taskId = controller.start('t', adapter);
+  const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
+  controller.reject(snap.awaitingApprovalFor!, 'not needed');
+  await controller.whenIdle();
+  await tick(20);
+  const op = recorder.getOperations(taskId).find((o) => o.operationType === 'Instruct' && /decline reason/.test(o.description));
+  assert.ok(op, 'delivery attempt is visible');
+  assert.equal(op!.status === 'Failed' || op!.status === 'Cancelled', true, op!.status);
+  if (op!.status === 'Failed') assert.match(op!.resultSummary!, /NOT delivered/);
+});

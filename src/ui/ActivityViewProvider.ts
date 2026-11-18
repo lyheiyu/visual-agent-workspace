@@ -84,6 +84,16 @@ export class ActivityViewProvider implements vscode.WebviewViewProvider, vscode.
           void this.controls.gotoAffectedFunction(id, m.index);
         }
         return;
+      case 'copy':
+        if (id && (m.what === 'command' || m.what === 'output')) {
+          void this.controls.copyFromOperation(id, m.what);
+        }
+        return;
+      case 'explainFunction':
+        if (id && typeof m.index === 'number' && Number.isInteger(m.index) && m.index >= 0 && m.index < 1000) {
+          void this.controls.explainAffectedFunction(id, m.index);
+        }
+        return;
       case 'selectTask':
         if (typeof m.taskId === 'string' && /^[\w-]{1,100}$/.test(m.taskId)) {
           this.controls.selectTask(m.taskId);

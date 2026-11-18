@@ -9,7 +9,7 @@ import { ChatMessage } from './OllamaClient';
  * passed through secret redaction before it leaves the extension.
  */
 
-export type ReviewKind = 'explain' | 'review' | 'impact' | 'error';
+export type ReviewKind = 'explain' | 'review' | 'impact' | 'error' | 'detail' | 'command';
 
 export interface CodeBlock {
   filePath: string;
@@ -196,6 +196,33 @@ export function explainErrorPrompt(
       { text: `Command: \`${input.command}\`\nExit code: ${input.exitCode ?? 'unknown'}${input.cwd ? `\nWorking directory: ${input.cwd}` : ''}`, priority: 0 },
       { text: `Output (last lines, as recorded):\n\`\`\`\n${tail}\n\`\`\``, priority: 0 },
       ...input.related.map((b, i) => ({ text: fence({ ...b, label: b.label ?? 'Related code' }), priority: 1 + i })),
+    ],
+    budgetChars,
+    lang,
+  );
+}
+
+/** Explain a recorded shell command: purpose, read/write scope, risks. Never asks to run it. */
+export function explainCommandPrompt(
+  input: { command: string; cwd?: string; status: string; exitCode?: number; output?: string; facts: { summary: string; writes: boolean; writeReasons: string[]; writeTargets: string[]; embeddedCode: boolean } },
+  budgetChars: number,
+  lang: ResponseLanguage = 'en',
+): BuiltPrompt {
+  const facts = [
+    `Static summary (from the command text, heuristic): ${input.facts.summary}`,
+    `May write files (heuristic): ${input.facts.writes ? 'yes — ' + input.facts.writeReasons.join('; ') : 'no write detected'}${input.facts.writeTargets.length ? `; targets: ${input.facts.writeTargets.join(', ')}` : ''}`,
+    input.facts.embeddedCode ? 'Contains embedded code (inline script, here-document or multiple lines).' : '',
+  ].filter(Boolean).join('\n');
+  return build(
+    [
+      'Explain this shell command that a coding agent proposed or ran. Do not run it and do not suggest running it.',
+      'Answer with these sections: "## Purpose" (what it does, step by step for chained commands or embedded code), "## Reads" (files, directories, network, environment it reads), "## Writes" (files it may create, modify or delete, packages or repository state it changes; say "none" only if certain), "## Risks" (data loss, overwriting, secrets, network, irreversible effects; rate high/medium/low).',
+      'Separate what is certain from the command text from what depends on scripts or files you cannot see. The static facts below are heuristics; correct them if wrong.',
+    ].join(' '),
+    [
+      { text: `Command (exact, as recorded):\n\`\`\`\n${input.command}\n\`\`\`\nWorking directory: ${input.cwd ?? 'unknown'}\nStatus: ${input.status}${input.exitCode !== undefined ? `, exit code ${input.exitCode}` : ''}`, priority: 0 },
+      { text: facts, priority: 0 },
+      ...(input.output ? [{ text: `Recorded output (last lines):\n\`\`\`\n${tailLines(input.output, 40)}\n\`\`\``, priority: 1 }] : []),
     ],
     budgetChars,
     lang,

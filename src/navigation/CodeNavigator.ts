@@ -11,6 +11,10 @@ export interface NavigationTarget {
   label?: string;
   /** 1-based line ranges to highlight instead of the located function (e.g. actual changed lines). */
   highlightLines?: Array<{ startLine: number; endLine: number }>;
+  /** 1-based column for the cursor when `lineNumber` is given. */
+  column?: number;
+  /** The user explicitly confirmed opening a file outside the workspace. */
+  allowOutsideWorkspace?: boolean;
 }
 
 export interface NavigationOptions {
@@ -80,8 +84,8 @@ export class CodeNavigator implements vscode.Disposable {
     return this.rootOverride ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   }
 
-  resolve(filePath: string, workspaceRoot?: string): PathResolution {
-    const allowOutside = vscode.workspace
+  resolve(filePath: string, workspaceRoot?: string, allowOutsideOverride = false): PathResolution {
+    const allowOutside = allowOutsideOverride || vscode.workspace
       .getConfiguration('visualAgent')
       .get<boolean>('allowNavigationOutsideWorkspace', false);
     return resolveWorkspacePath(workspaceRoot ?? this.workspaceRoot(), filePath, { allowOutsideWorkspace: allowOutside });
@@ -91,7 +95,7 @@ export class CodeNavigator implements vscode.Disposable {
     if (!target.filePath) {
       return { ok: false, reason: 'This operation is not associated with a file.' };
     }
-    const resolved = this.resolve(target.filePath, target.workspaceRoot);
+    const resolved = this.resolve(target.filePath, target.workspaceRoot, target.allowOutsideWorkspace === true);
     if (!resolved.ok) {
       return this.fail(resolved.reason);
     }
@@ -119,6 +123,11 @@ export class CodeNavigator implements vscode.Disposable {
       viewColumn: options.viewColumn,
       selection: options.preserveFocus ? undefined : new vscode.Range(located.range.start, located.range.start),
     });
+    if (located.matchedBy === 'line' && target.column && target.column > 1 && !options.preserveFocus) {
+      const col = Math.min(target.column - 1, document.lineAt(located.range.start.line).text.length);
+      const at = new vscode.Position(located.range.start.line, col);
+      editor.selection = new vscode.Selection(at, at);
+    }
     const ranges = this.clampRanges(document, target.highlightLines) ?? [located.range];
     editor.revealRange(ranges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
     this.applyHighlight(editor, ranges, target.label);

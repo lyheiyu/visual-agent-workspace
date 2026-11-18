@@ -13,6 +13,8 @@ const filename = process.argv[2] || path.resolve(__dirname, `../artifacts/${mani
   const names = Object.keys(zip.files);
   assert.ok(zip.file('extension/out/extension.js'));
   assert.ok(zip.file('extension/media/conversation.js'));
+  for (const f of ['markdownView.js', 'explain.js', 'explain.css']) assert.ok(zip.file('extension/media/' + f), f);
+  assert.ok(zip.file('extension/out/references/ReferenceNavigator.js') && zip.file('extension/out/reviewer/ExplainController.js'));
   assert.ok(zip.file('extension/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'));
   assert.ok(!names.some((name) => /(^|\/)(\.git|\.vscode|\.vscode-test|artifacts|src|tests?)(\/|$)/.test(name)));
   assert.ok(!names.some((name) => /\.(exe|vsix)$|(^|\/)\.env(?:\.|$)|auth\.json|credentials\.json/i.test(name)));

@@ -227,6 +227,23 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
     void this.client?.close();
   }
 
+  /**
+   * Codex's approval reply carries only accept/decline, so the user's reason
+   * (rejection reason, regenerate feedback, "I applied my own version") is
+   * sent right after the decline as a steer of the same turn. The outcome is
+   * recorded: if the turn already ended, the timeline says it was NOT delivered.
+   */
+  private deliverReason(sink: OperationSink, what: 'command' | 'file change', subject: string, reason: string): void {
+    const text = `The user declined your proposed ${what}${subject ? ` (${subject.slice(0, 300)})` : ''}. Their reason / feedback: ${reason.slice(0, 2500)}`;
+    setTimeout(() => {
+      const op = sink.announce({ operationType: 'Instruct', description: `Send decline reason to Codex: ${reason.slice(0, 100)}`, rationale: text });
+      this.steer(text).then(
+        () => sink.complete(op, { outcome: 'Completed', resultSummary: 'Delivered to the active Codex turn (turn/steer).' }),
+        (err) => sink.complete(op, { outcome: 'Failed', resultSummary: `NOT delivered: ${(err as Error).message}. Codex only received "decline".` }),
+      );
+    }, 0);
+  }
+
   // ------------------------------------------------------------ internals
 
   private async defaultModel(client: CodexRpcClient): Promise<string | undefined> {
@@ -315,9 +332,11 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
           sink.autoDecide(opId, 'rejected', `the "${profile.label}" profile never grants command approvals`);
           return { decision: 'decline' satisfies ApprovalDecision };
         }
-        const { decision } = await sink.requestDecision(opId, p.reason ?? undefined);
+        const { decision, reason } = await sink.requestDecision(opId, p.reason ?? undefined);
         if (decision === 'approved') {
           sink.markRunning(opId, 'Approved by user; Codex runs it inside the read-only sandbox');
+        } else if (decision === 'rejected' && reason) {
+          this.deliverReason(sink, 'command', p.command ?? '', reason);
         }
         return { decision: toCodexDecision(decision) };
       }
@@ -347,9 +366,11 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
           sink.autoDecide(opId, 'rejected', `Codex asked for session-wide write access to ${p.grantRoot}; only single patches can be approved`);
           return { decision: 'decline' };
         }
-        const { decision } = await sink.requestDecision(opId, p.reason ?? undefined);
+        const { decision, reason } = await sink.requestDecision(opId, p.reason ?? undefined);
         if (decision === 'approved') {
           sink.markRunning(opId, 'Approved by user; Codex applies this entire patch');
+        } else if (decision === 'rejected' && reason) {
+          this.deliverReason(sink, 'file change', paths.join(', '), reason);
         }
         return { decision: toCodexDecision(decision) };
       }

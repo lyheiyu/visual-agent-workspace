@@ -12,6 +12,23 @@
   const app = document.getElementById('app');
   const send = (message) => vscode.postMessage(message);
   const S = (key) => model?.strings[key] || key;
+  // Markdown + clickable file references (media/markdownView.js). Clicking only posts a message;
+  // the extension host validates and resolves the path before opening an editor.
+  const MD = window.VAWMarkdown;
+  const md = MD && MD.create(document, {
+    onRef: (ref, side) => send({ type: 'openReference', ref: { path: ref.path, line: ref.line, column: ref.column, endLine: ref.endLine }, side }),
+    onLink: (href) => send({ type: 'openLink', href }),
+    refTitle: (ref) => `${S('ref.open')}: ${MD.label(ref)}
+${S('ref.hint')}`,
+    linkTitle: (href) => `${S('ref.external')}: ${href}`,
+  });
+  const body = (ast, text) => {
+    try { return md && ast ? md.render(ast) : el('pre', text); }
+    catch (error) {
+      console.error('Conversation formatting failed; displaying the original text.', error);
+      return el('pre', text);
+    }
+  };
   function el(tag, text, className) {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -23,6 +40,17 @@
     node.disabled = disabled;
     node.addEventListener('click', callback);
     return node;
+  }
+  /** @param {any} node @param {string} title */
+  function titled(node, title) { node.title = title; return node; }
+  /** Manual-change actions reuse the conversation; "continue" takes the composer text as the next step. */
+  function sendManual(kind) {
+    if (!model?.canSend || sending) return;
+    sending = true;
+    errors[model.taskId] = '';
+    pending = kind === 'continue' ? { taskId: model.taskId, text: (drafts[model.taskId] || '').trim() } : undefined;
+    send({ type: 'manual', kind, text: kind === 'continue' ? (drafts[model.taskId] || '') : undefined });
+    render();
   }
   function persist() { vscode.setState({ drafts, selectedTaskId: model?.taskId }); }
   function submit(useSavedContext = false) {
@@ -66,10 +94,12 @@
     main.append(header);
     const messages = el('div', undefined, 'messages');
     messages.id = 'messages';
+    // Merged into right-click context-menu arguments for file references (webview/context).
+    if (model.taskId) messages.setAttribute('data-vscode-context', JSON.stringify({ taskId: model.taskId }));
     if (!model.taskId) messages.append(el('p', S('chat.empty'), 'muted'));
     for (const message of model.messages) {
       const item = el('article', undefined, 'message ' + message.role);
-      item.append(el('strong', S(message.role === 'user' ? 'a.you' : 'a.assistant')), el('pre', message.text), el('small', new Date(message.timestamp).toLocaleString()));
+      item.append(el('strong', S(message.role === 'user' ? 'a.you' : 'a.assistant')), body(message.ast, message.text), el('small', new Date(message.timestamp).toLocaleString()));
       messages.append(item);
     }
     if (model.turns.length) {
@@ -78,16 +108,52 @@
         const item = el('details', undefined, 'turn' + (turn.failedOperations ? ' failed' : ''));
         item.open = turn === model.turns[model.turns.length - 1];
         item.append(el('summary', `#${turn.number} · ${S(turn.failedOperations ? 'chat.turnFailed' : 'status.' + turn.status)}`));
-        if (turn.report) item.append(el('pre', turn.report));
+        if (turn.report) item.append(body(turn.ast, turn.report));
         messages.append(item);
       }
     }
+    if (model.preview) {
+      // A proposal is being generated. Live text only if the runtime streams it; editing waits for the finished proposal.
+      const box = el('article', undefined, 'approval preview');
+      box.setAttribute('role', 'status');
+      if (model.preview.text) {
+        const pre = el('pre', model.preview.text);
+        pre.className = 'mono preview-text';
+        box.append(el('strong', S('p.preview')), el('p', [model.preview.filePath, model.preview.characters + ' chars'].filter(Boolean).join(' · '), 'muted'), pre, el('p', S('p.previewNote'), 'muted'));
+      } else {
+        box.append(el('strong', S('p.generating')), model.preview.filePath ? el('p', model.preview.filePath, 'muted') : '', el('p', S('p.generatingNote'), 'muted'));
+      }
+      box.append(button(S('p.editFirst') + ' — ' + S('p.editAfterGeneration'), () => {}, true));
+      messages.append(box);
+    }
     for (const approval of model.approvals) {
-      const item = el('article', undefined, 'approval');
-      item.append(el('strong', S('a.approvalNeeded')), el('p', approval.description),
-        button(S('a.reviewDiff'), () => send({ type: 'action', action: 'review', operationId: approval.id })),
-        button(S('a.approve'), () => send({ type: 'action', action: 'approve', operationId: approval.id })),
-        button(S('a.reject'), () => send({ type: 'action', action: 'reject', operationId: approval.id })));
+      const item = el('article', undefined, 'approval' + (approval.conflict ? ' conflict' : ''));
+      const title = el('p');
+      title.append(el('span', approval.cmd ? approval.cmd.summary : approval.description));
+      if (approval.cmd && approval.cmd.writes) {
+        const pill = el('span', S('c.writes'), 'pill writes');
+        pill.title = S('c.heuristicTip') + ': ' + approval.cmd.writeReasons.join('; ');
+        title.append(' ', pill);
+      }
+      item.append(el('strong', S('a.approvalNeeded')), title);
+      if (approval.command && !(approval.cmd && approval.cmd.writes)) item.append(el('p', S('c.noWriteDetected'), 'muted'));
+      if (approval.command) {
+        const d = el('details');
+        d.append(el('summary', S(approval.cmd && approval.cmd.embeddedCode ? 'c.fullCommandCode' : 'c.fullCommand')), el('pre', approval.command));
+        d.open = !(approval.cmd && (approval.cmd.long || approval.cmd.embeddedCode));
+        item.append(d);
+      }
+      if (approval.conflict) item.append(el('p', S('p.conflict').replace('{what}', approval.conflict), 'error'));
+      const row = el('div', undefined, 'actions');
+      const feedback = () => (drafts[model.taskId] || '').trim();
+      row.append(
+        approval.hasChange ? button(S('a.reviewDiff'), () => send({ type: 'action', action: 'review', operationId: approval.id })) : '',
+        button(S('a.approve'), () => send({ type: 'action', action: 'approve', operationId: approval.id }), !!approval.conflict),
+        button(S('a.reject'), () => send({ type: 'action', action: 'reject', operationId: approval.id })),
+        approval.hasChange && approval.type === 'Edit' ? button(approval.editing ? S('p.applyMine') : S('p.editFirst'), () => send({ type: 'action', action: approval.editing ? 'applyEdited' : 'editProposal', operationId: approval.id })) : '',
+        button(S('p.regenerate'), () => send({ type: 'regenerate', operationId: approval.id, feedback: feedback() })),
+      );
+      item.append(row);
       messages.append(item);
     }
     main.append(messages);
@@ -113,6 +179,14 @@
         if (!drafts[model.taskId]) drafts[model.taskId] = model.messages.filter((m) => m.role === 'user').at(-1)?.text || '';
         submit(true);
       }, !model.canSend || sending));
+      if (model.manual && model.manual.tracked) {
+        buttons.append(
+          titled(button(S('m.check'), () => sendManual('check'), !model.canSend || sending), S('m.checkTip')),
+          titled(button(S('m.continue'), () => sendManual('continue'), !model.canSend || sending), S('m.continueTip')),
+        );
+      }
+      if (model.manual && model.manual.validating) composer.append(el('p', S('m.validating'), 'muted'));
+      if (model.manual && model.manual.last) composer.append(el('pre', model.manual.last.text, model.manual.last.ok ? 'muted' : 'error'));
       composer.append(buttons);
       main.append(composer);
     }
@@ -135,6 +209,9 @@
         errors[data.taskId] = '';
       }
       pending = undefined;
+      persist(); render();
+    } else if (data?.type === 'regenerated') {
+      drafts[data.taskId] = '';
       persist(); render();
     } else if (data?.type === 'error') { sending = false; pending = undefined; errors[data.taskId] = data.message; render(); }
   });

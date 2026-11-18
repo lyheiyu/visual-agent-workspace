@@ -114,6 +114,7 @@
           button(S('r.review'), () => send({ type: 'run', kind: 'review' }), { disabled: !ready, title: S('r.reviewTip'), key: 'review' }),
           button(S('r.impact'), () => send({ type: 'run', kind: 'impact' }), { disabled: !ready, title: S('r.impactTip'), key: 'impact' }),
           button(S('r.error'), () => send({ type: 'run', kind: 'error' }), { disabled: !ready, title: S('r.errorTip'), key: 'error' }),
+          button(S('r.detail'), () => send({ type: 'run', kind: 'detail' }), { disabled: !ready, title: S('r.detailTip'), key: 'detail' }),
         ]),
         busy && button(S('r.cancel'), () => send({ type: 'cancel' }), { kind: 'danger', title: S('r.cancelTip'), key: 'cancel' }),
       ]),

@@ -87,3 +87,10 @@ test('enclosing function inference for edit labels', () => {
   assert.equal(findEnclosingFunction(ts, 2), 'run');
   assert.equal(findEnclosingFunction(ts, 6), 'other');
 });
+
+test('Codex added/deleted files: file content is turned into a real diff (stats and review are correct)', () => {
+  const m = new CodexItemMapper(path.resolve(__dirname, '..', '..', 'demo-workspace'));
+  const op: any = m.announce({ type: 'fileChange', id: 'p-add', status: 'inProgress', changes: [{ path: 'greeting.txt', kind: { type: 'add' }, diff: 'hi\nthere\n' }] } as any);
+  assert.match(op.description, /Create greeting\.txt \(\+2 −0\)/);
+  assert.match(op.changes[0].unifiedDiff, /^@@ -0,0 \+1,2 @@/m);
+});

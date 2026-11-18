@@ -54,6 +54,9 @@ export interface ControllerSnapshot {
   boundary?: string;
   /** Multi-turn session idle and waiting for the next instruction. */
   awaitingInput: boolean;
+  progress?: { phase: 'thinking' | 'answering' | 'tool'; characters: number };
+  /** File change still being generated (display only; tail of the streamed content). */
+  preview?: { tool: string; filePath?: string; text: string; characters: number };
 }
 
 type DispatchOutcome = 'completed' | 'failed' | 'rejected' | 'cancelled';
@@ -99,6 +102,11 @@ export class AgentController {
   private abort: AbortController | undefined;
   private runPromise: Promise<void> | undefined;
   private awaitingInput = false;
+  private progress: ControllerSnapshot['progress'];
+  private progressEmittedAt = 0;
+  private preview: ControllerSnapshot['preview'];
+  private previewEmittedAt = 0;
+  private previewTimer: NodeJS.Timeout | undefined;
 
   constructor(
     defaultAdapter: AgentAdapter,
@@ -130,6 +138,8 @@ export class AgentController {
       capabilities: streaming ? (this.adapter as StreamingAgentAdapter).capabilities : MOCK_CAPABILITIES,
       boundary: streaming ? (this.adapter as StreamingAgentAdapter).boundary : undefined,
       awaitingInput: this.isActive && this.awaitingInput,
+      progress: this.isActive ? this.progress : undefined,
+      preview: this.isActive && !this.awaitingInput ? this.preview : undefined,
     };
   }
 
@@ -167,6 +177,8 @@ export class AgentController {
     this.stopRequested = false;
     this.currentOperationId = undefined;
     this.awaitingInput = false;
+    this.progress = undefined;
+    this.preview = undefined;
     this.abort = new AbortController();
     const ctx: AgentTaskContext = {
       taskId: task.taskId,
@@ -254,6 +266,8 @@ export class AgentController {
     if (wasWaiting) {
       this.recorder.startTurn(this.taskId);
       this.awaitingInput = false;
+      this.progress = undefined;
+      this.preview = undefined;
       this.emitState();
     }
     this.recorder.recordMessage(this.taskId, 'user', trimmed);
@@ -671,11 +685,38 @@ export class AgentController {
         if (this.awaitingInput !== waiting) {
           if (waiting) this.recorder.finishTurn(ctx.taskId, 'Completed');
           this.awaitingInput = waiting;
+          if (waiting) this.progress = undefined;
+          if (waiting) this.preview = undefined;
           if (waiting) this.currentOperationId = undefined;
           this.emitState();
         }
       },
       setSession: (session) => this.recorder.setSession(ctx.taskId, session),
+      setPreview: (p) => {
+        if (this.stopRequested) return;
+        const had = !!this.preview;
+        this.preview = p ? { tool: p.tool, filePath: p.filePath, text: p.text.length > 6000 ? p.text.slice(-6000) : p.text, characters: p.text.length } : undefined;
+        if (had !== !!p || Date.now() - this.previewEmittedAt >= 300) {
+          this.previewEmittedAt = Date.now();
+          this.emitState();
+        } else {
+          // Trailing update so the latest streamed text is always shown.
+          this.previewTimer ??= setTimeout(() => {
+            this.previewTimer = undefined;
+            this.previewEmittedAt = Date.now();
+            if (this.preview) this.emitState();
+          }, 300);
+        }
+      },
+      setProgress: (phase, characters) => {
+        if (this.stopRequested || this.awaitingInput) return;
+        const changed = this.progress?.phase !== phase;
+        this.progress = { phase, characters };
+        if (changed || Date.now() - this.progressEmittedAt >= 750) {
+          this.progressEmittedAt = Date.now();
+          this.emitState();
+        }
+      },
     };
   }
 
@@ -726,6 +767,8 @@ export class AgentController {
     this.pendingDecisions.clear();
     this.currentOperationId = undefined;
     this.awaitingInput = false;
+    this.progress = undefined;
+    this.preview = undefined;
     this.abort = undefined;
     this.emitState();
   }

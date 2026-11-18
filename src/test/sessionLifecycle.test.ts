@@ -113,3 +113,68 @@ test('stop interrupts a round and reload never changes an unfinished turn into c
   assert.equal(reload.getTask(t.taskId)!.turns![0].status, 'Stopped');
   assert.ok(saved);
 });
+
+test('thinking-only generation reaching the output limit is reported as failure, without persisting reasoning', async () => {
+  const fake = new FakeOpenCode();
+  let thinkingLabel = '';
+  fake.turns = [async (s) => {
+    s.assistant('long-answer');
+    s.emit({ type: 'message.part.updated', properties: { sessionID: s.sessionId, part: { id: 'reasoning-part', messageID: 'long-answer', type: 'reasoning', text: 'PRIVATE_REASONING_DO_NOT_STORE' } } });
+    thinkingLabel = buildActivityViewModel(r, c.getSnapshot(), { follow: false, language: 'en' }).header.statusLabel;
+    s.emit({ type: 'message.part.delta', properties: { sessionID: s.sessionId, partID: 'reasoning-part', field: 'text', delta: ' more reasoning' } });
+    const complete = { type: 'message.updated', properties: { sessionID: s.sessionId, info: { id: 'long-answer', role: 'assistant', modelID: 'qwen3:8b', providerID: 'ollama', finish: 'length' } } };
+    s.emit(complete); s.emit(complete); s.idle();
+  }];
+  const r = new EventRecorder(); const c = controller(r);
+  const id = c.start('Create a game', adapter(fake), root);
+  await ready(c);
+  assert.match(thinkingLabel, /reasoning/);
+  const turn = r.getTask(id)!.turns![0];
+  assert.equal(turn.failedOperations, 1, 'a duplicate final event must not duplicate the warning');
+  assert.match(turn.report!, /output limit/);
+  assert.match(turn.report!, /No recorded file edits/);
+  assert.ok(!JSON.stringify(r.exportHistory()).includes('PRIVATE_REASONING_DO_NOT_STORE'));
+  assert.equal(c.getSnapshot().progress, undefined, 'idle clears thinking status');
+  await c.endSession(); await c.whenIdle();
+});
+
+test('failed outside-project writes plus successful echo do not produce an unqualified completed report', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant();
+    s.tool('wrong-path', 'write', 'error', { filePath: path.join(os.tmpdir(), 'outside-game', 'resource.js'), content: 'export const resources = {};' }, { error: 'external_directory denied' });
+    s.tool('only-echo', 'bash', 'completed', { command: 'echo generated files' }, { metadata: { exit: 0, output: 'generated files' } });
+    s.idle();
+  }];
+  const r = new EventRecorder(); const c = controller(r);
+  const id = c.start('Create game files', adapter(fake), root);
+  await ready(c);
+  const report = r.getTask(id)!.turns![0].report!;
+  assert.match(report, /Finished with failed operations/);
+  assert.match(report, /resource\.js: Failed/);
+  assert.match(report, /external_directory denied/);
+  assert.match(report, /echo generated files: Completed, exit 0/);
+  const prompt = fake.requests.find((request) => request.route.endsWith('/prompt_async'))!.body;
+  assert.ok(prompt.system.includes(JSON.stringify(root)));
+  await c.endSession(); await c.whenIdle();
+});
+
+test('a failed approval response ends the runtime with a visible error instead of silently hanging', async () => {
+  const fake = new FakeOpenCode();
+  const request = fake.request.bind(fake);
+  fake.request = async (method, route, body) => {
+    if (route.includes('/permission/')) throw new Error('Test connection closed');
+    return request(method, route, body);
+  };
+  fake.turns = [async (s) => {
+    s.assistant(); s.tool('write', 'write', 'running', { filePath: path.join(root, 'index.html'), content: '<html></html>' });
+    void s.permission('write-permission', 'edit', 'write', { filepath: path.join(root, 'index.html') });
+  }];
+  const r = new EventRecorder(); const c = controller(r);
+  const id = c.start('Create index.html', adapter(fake), root);
+  while (!c.getSnapshot().awaitingApprovalFor) await new Promise((resolve) => setTimeout(resolve, 5));
+  c.approve(c.getSnapshot().awaitingApprovalFor!);
+  await c.whenIdle();
+  assert.equal(r.getTask(id)!.status, 'Failed');
+  assert.match(r.getTask(id)!.summary!, /Permission reply could not be confirmed/);
+});

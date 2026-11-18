@@ -29,7 +29,7 @@ test('string table: every entry has English and Chinese; default language is 中
 
 test('every string key used by the webviews exists (static, no LLM)', () => {
   const keys = new Set(Object.keys(STRINGS));
-  for (const file of ['activity.js', 'reviewer.js']) {
+  for (const file of ['activity.js', 'reviewer.js', 'explain.js', 'conversation.js']) {
     const src = fs.readFileSync(path.join(MEDIA, file), 'utf8');
     for (const m of src.matchAll(/\bS\('([\w.\-]+)'\s*[,)]/g)) {
       assert.ok(keys.has(m[1]), `${file}: missing key ${m[1]}`);

@@ -8,6 +8,7 @@ import { RecordDocumentProvider } from '../ui/RecordDocumentProvider';
 import { ActivityViewModel, buildActivityViewModel } from '../ui/viewModel';
 import { AgentOperation } from '../types/events';
 import { CODEX_PROFILES, CodexProfileId } from '../adapters/codex/profiles';
+import { ProposalReview } from '../review/ProposalReview';
 import { localizeError, normalizeLanguage, UiLanguage } from '../i18n/i18n';
 
 export interface TaskStarters {
@@ -37,6 +38,11 @@ export const CONTROL_ACTIONS = [
   'conversation',
   'continueHistory',
   'openChat',
+  'editProposal',
+  'applyEdited',
+  'regenerate',
+  'aiExplainCommand',
+  'record',
 ] as const;
 export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 
@@ -62,6 +68,8 @@ export class HumanControlManager implements vscode.Disposable {
   private readonly statusBar: vscode.StatusBarItem;
   private navigationQueue: Promise<unknown> = Promise.resolve();
   private promptedFor = new Set<string>();
+  /** Review before writing: conflict gate, edit-before-apply, regenerate with feedback. */
+  readonly proposals: ProposalReview;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -76,6 +84,10 @@ export class HumanControlManager implements vscode.Disposable {
     // Stored in workspaceState (not settings.json) so toggling never writes workspace files.
     this.follow = context.workspaceState.get<boolean>(FOLLOW_KEY, configured);
     this.selectedTaskId = context.workspaceState.get<string>(SELECTED_CONVERSATION_KEY);
+
+    this.proposals = new ProposalReview(context.globalStorageUri, controller, recorder, review, log);
+    const propSub = this.proposals.onDidChange(() => this.viewEmitter.fire());
+    this.disposables.push(this.proposals, propSub);
 
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
     this.statusBar.command = 'visualAgent.activity.focus';
@@ -231,7 +243,25 @@ export class HumanControlManager implements vscode.Disposable {
         case 'stop':
           return this.feedback(this.controller.stop(), 'There is no running task to stop.');
         case 'approve':
-          return this.approve(operationId);
+          return await this.approve(operationId);
+        case 'editProposal':
+          await this.proposals.editBeforeApplying(this.pendingId(operationId));
+          return;
+        case 'applyEdited':
+          await this.proposals.applyEditedVersion(this.pendingId(operationId));
+          return;
+        case 'regenerate':
+          await this.proposals.regenerate(this.pendingId(operationId));
+          return;
+        case 'record': {
+          // Full audit record of one operation (read-only document; nothing is lost from the panel).
+          const op = this.resolveOp(operationId);
+          if (op) await this.openRecord(RecordDocumentProvider.operationUri(op.operationId), 'markdown');
+          return;
+        }
+        case 'aiExplainCommand':
+          await vscode.commands.executeCommand('visualAgent.reviewer.explainCommand', operationId);
+          return;
         case 'reject':
           return await this.reject(operationId);
         case 'review':
@@ -380,8 +410,27 @@ export class HumanControlManager implements vscode.Disposable {
     }
   }
 
-  private approve(operationId?: string): void {
+  private pendingId(operationId?: string): string {
+    return operationId ?? this.controller.getSnapshot().awaitingApprovalFor ?? '';
+  }
+
+  /** Copy the ORIGINAL recorded command or output (never a display-truncated version). */
+  async copyFromOperation(operationId: string, what: 'command' | 'output'): Promise<boolean> {
+    const op = this.recorder.getOperation(operationId);
+    if (!op?.command) return false;
+    const text = what === 'command' ? op.command.command : [op.command.stdout, op.command.stderr].filter(Boolean).join('\n');
+    if (!text) return false;
+    await vscode.env.clipboard.writeText(text);
+    vscode.window.setStatusBarMessage(`$(check) ${what === 'command' ? 'Command' : 'Output'} copied`, 2500);
+    return true;
+  }
+
+  private async approve(operationId?: string): Promise<void> {
     const id = operationId ?? this.controller.getSnapshot().awaitingApprovalFor;
+    // Never let an approval overwrite changes made after the diff was shown.
+    if (id && this.controller.getSnapshot().pendingApprovals.includes(id) && !(await this.proposals.guardApproval(id))) {
+      return;
+    }
     if (!id || !this.controller.approve(id)) {
       void vscode.window.showWarningMessage(localizeError('That operation is not awaiting approval.', this.language()));
       return;
@@ -537,6 +586,27 @@ export class HumanControlManager implements vscode.Disposable {
     } else if (result.warning) {
       void vscode.window.showWarningMessage(result.warning);
     }
+  }
+
+  /** Function-level navigation → Explain Code in Detail for that function (explicit click). */
+  async explainAffectedFunction(operationId: string, index: number): Promise<void> {
+    const op = this.recorder.getOperation(operationId);
+    const fn = op?.affectedFunctions?.[index];
+    if (!op || !fn) {
+      return;
+    }
+    await this.gotoAffectedFunction(operationId, index);
+    const editor = vscode.window.activeTextEditor;
+    const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    // Only explain if navigation really opened the function's file.
+    if (!editor || editor.document.uri.scheme !== 'file' || !norm(editor.document.uri.fsPath).endsWith(norm(fn.filePath))) {
+      return;
+    }
+    await vscode.commands.executeCommand('visualAgent.explainCodeInDetail', {
+      uri: editor.document.uri.toString(),
+      line: editor.selection.active.line + 1,
+      scope: fn.side === 'old' && op.status === 'Completed' ? undefined : 'symbol',
+    });
   }
 
   /** Called once for every operation that enters the controller's pending-approval list. */

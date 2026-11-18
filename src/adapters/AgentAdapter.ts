@@ -167,6 +167,14 @@ export interface OperationSink {
   setAwaitingInput?(waiting: boolean): void;
   /** Native provider session identity (not a credential). */
   setSession?(session: { provider: 'local'; id: string }): void;
+  /** Display progress metadata only; never persist model reasoning text. */
+  setProgress?(phase: 'thinking' | 'answering' | 'tool', characters: number): void;
+  /**
+   * Live preview of a file change the model is still generating (before any
+   * approval request). Display only: never applied, never persisted.
+   * `undefined` clears it (the proposal is complete or abandoned).
+   */
+  setPreview?(preview: { tool: string; filePath?: string; text: string } | undefined): void;
 }
 
 export interface StreamingAgentAdapter {

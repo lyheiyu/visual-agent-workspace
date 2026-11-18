@@ -9,6 +9,8 @@ export class FakeOllama {
   /** Tokens streamed by /api/chat. */
   tokens = ['The ', 'function ', 'validates ', 'samples.'];
   thinkingTokens: string[] = [];
+  /** Optional reply builder (e.g. echo line ranges found in the prompt). */
+  respond?: (request: any) => string[];
   /** Delay between streamed chunks; Infinity-like values simulate a stuck model. */
   chunkDelayMs = 0;
   chatRequests: any[] = [];
@@ -71,7 +73,7 @@ export class FakeOllama {
       for (const t of this.thinkingTokens) {
         await send({ model: parsed.model, message: { role: 'assistant', content: '', thinking: t }, done: false });
       }
-      for (const t of this.tokens) {
+      for (const t of this.respond ? this.respond(parsed) : this.tokens) {
         await send({ model: parsed.model, message: { role: 'assistant', content: t }, done: false });
       }
       if (!closed) {

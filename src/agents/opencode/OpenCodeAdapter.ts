@@ -3,12 +3,14 @@ import { NormalizedEventApplier } from '../../adapters/normalizedEvents';
 import { DESTRUCTIVE_COMMAND, insideWorkspace, isSensitive, mapToolCall, readTextSafe, relPath } from '../toolMapping';
 import { OpenCodeConnection, OpenCodeConnector, OpenCodeLaunch } from './OpenCodeServer';
 import * as path from 'node:path';
+import { localWorkflowPrompt, LocalWorkflow } from './localWorkflow';
 
 export interface OpenCodeAdapterOptions {
   resumeSessionId?: string;
   connector: OpenCodeConnector;
   launch: Omit<OpenCodeLaunch, 'workspaceRoot'>;
   readText?: (p: string) => string | undefined;
+  workflow?: LocalWorkflow;
 }
 
 /**
@@ -43,6 +45,9 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
   private readonly flushedTexts = new Set<string>();
   private readonly handledPermissions = new Set<string>();
   private modelViolation = false;
+  private readonly limitedMessages = new Set<string>();
+  private readonly partProgress = new Map<string, { phase: 'thinking' | 'answering'; characters: number }>();
+  private turnStartedAt = 0;
 
   constructor(private readonly options: OpenCodeAdapterOptions) {
     const p = options.launch.profile;
@@ -130,9 +135,12 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
 
   private async prompt(text: string): Promise<void> {
     this.busy = true;
+    this.turnStartedAt = Date.now();
+    this.partProgress.clear();
     this.sink?.setAwaitingInput?.(false);
     await this.conn!.request('POST', `/session/${this.sessionId}/prompt_async`, {
       model: { providerID: 'ollama', modelID: this.options.launch.model },
+      system: localWorkflowPrompt(this.options.launch.profile, this.options.workflow, this.root),
       parts: [{ type: 'text', text }],
     });
   }
@@ -161,6 +169,11 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
           this.userMessages.add(info.id);
         } else if (info.role === 'assistant') {
           this.assistantMessages.add(info.id);
+          if (info.finish === 'length' && !this.limitedMessages.has(info.id) && (!info.time?.created || info.time.created >= this.turnStartedAt)) {
+            this.limitedMessages.add(info.id);
+            const op = sink.announce({ operationType: 'Analyze', description: 'Local model output limit reached / 本地模型输出达到上限' });
+            sink.complete(op, { outcome: 'Failed', resultSummary: `The model stopped at its output limit (${this.options.launch.outputLimit} tokens). This is not evidence that files were created or the task completed. Check the recorded Edit operations. Break the task into a small first file, or choose a model/context size that fits this machine. / 模型输出被截断，不代表文件已创建；请查看实际编辑记录，并将任务拆成较小步骤。` });
+          }
           // No silent model substitution: every reply must come from the selected local model.
           if (info.providerID && (info.providerID !== 'ollama' || info.modelID !== this.options.launch.model) && !this.modelViolation) {
             this.modelViolation = true;
@@ -173,8 +186,21 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
       }
       case 'message.part.updated':
         return this.onPart(p.part);
+      case 'message.part.delta': {
+        const part = this.partProgress.get(p.partID);
+        if (part && p.field === 'text' && typeof p.delta === 'string') {
+          part.characters += p.delta.length;
+          sink.setProgress?.(part.phase, part.characters);
+        }
+        return;
+      }
       case 'permission.asked':
-        void this.onPermission(p);
+        void this.onPermission(p).catch((error) => {
+          const message = `OpenCode approval failed: ${(error as Error).message}`;
+          const op = sink.announce({ operationType: 'Analyze', description: 'Could not complete tool approval / 工具审批失败' });
+          sink.complete(op, { outcome: 'Failed', resultSummary: message });
+          this.finish?.({ outcome: 'failed', message });
+        });
         return;
       case 'session.idle':
         if (!this.busy) return;
@@ -213,6 +239,11 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
     if (!part) {
       return;
     }
+    if ((part.type === 'reasoning' || part.type === 'text') && !this.userMessages.has(part.messageID)) {
+      const progress = { phase: part.type === 'reasoning' ? 'thinking' as const : 'answering' as const, characters: typeof part.text === 'string' ? part.text.length : 0 };
+      this.partProgress.set(part.id, progress);
+      this.sink?.setProgress?.(progress.phase, progress.characters);
+    }
     if (part.type === 'text') {
       if (!this.userMessages.has(part.messageID) && typeof part.text === 'string') {
         this.texts.set(part.id, part.text);
@@ -222,12 +253,21 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
     if (part.type !== 'tool') {
       return;
     }
+    this.sink?.setProgress?.('tool', 0);
     const key = part.callID ?? part.id;
     const state = part.state ?? {};
     const input = state.input ?? {};
+    // Live preview while the model is still writing an edit's arguments (display only).
+    if (state.status === 'pending' && /^(edit|multiedit|write|patch)$/i.test(String(part.tool)) && !this.announced.has(key)) {
+      const text = typeof input.content === 'string' ? input.content : typeof input.newString === 'string' ? input.newString : typeof state.raw === 'string' ? state.raw : '';
+      // Empty text = this runtime does not stream edit arguments: the UI shows "generating; review when complete".
+      this.sink?.setPreview?.({ tool: String(part.tool), filePath: typeof input.filePath === 'string' ? relPath(this.root, input.filePath) : undefined, text });
+      return;
+    }
     if (!this.announced.has(key) && (state.status === 'running' || state.status === 'completed' || state.status === 'error') && Object.keys(input).length) {
       this.flushTexts();
       this.announced.add(key);
+      this.sink?.setPreview?.(undefined);
       this.applier!.apply({
         type: 'operation.announced',
         key,
@@ -279,7 +319,7 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
       try {
         await this.conn?.request('POST', `/permission/${req.id}/reply`, message ? { reply: r, message } : { reply: r });
       } catch (err) {
-        sink.log(`[opencode] permission reply failed: ${(err as Error).message}`);
+        throw new Error(`Permission reply could not be confirmed; check actual files before retrying: ${(err as Error).message}`);
       }
     };
     // Policy checks before involving the user.
@@ -291,7 +331,7 @@ export class OpenCodeAdapter implements StreamingAgentAdapter {
       const file = String(md.filepath ?? (req.patterns ?? [])[0] ?? '');
       if (!file || !insideWorkspace(this.root, file)) {
         sink.autoDecide(opId, 'rejected', `edit outside the workspace: ${file}`);
-        return reply('reject', 'Edits outside the workspace are not allowed.');
+        return reply('reject', `Edits outside the workspace are not allowed. Use an absolute path inside ${JSON.stringify(this.root)}. Do not retry in a temporary directory.`);
       }
       if (isSensitive(this.root, file)) {
         sink.autoDecide(opId, 'rejected', `protected file: ${relPath(this.root, file)}`);

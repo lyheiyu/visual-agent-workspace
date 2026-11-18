@@ -11,6 +11,21 @@
       ],
       "outFiles": ["${workspaceFolder}/out/**/*.js"],
       "preLaunchTask": "npm: dev:prepare"
+    },
+    {
+      "name": "Run Visual Agent Workspace (isolated startup)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--user-data-dir=${workspaceFolder}/.vscode-test/dev-user-data",
+        "--disable-extensions",
+        "--skip-welcome",
+        "${workspaceFolder}/.vscode/visual-agent.local.code-workspace"
+      ],
+      "env": { "ELECTRON_RUN_AS_NODE": null, "NODE_OPTIONS": null },
+      "outFiles": ["${workspaceFolder}/out/**/*.js"],
+      "preLaunchTask": "npm: dev:prepare"
     }
   ]
 }

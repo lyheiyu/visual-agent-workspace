@@ -1,7 +1,7 @@
 import * as path from 'node:path';
 import { AnnouncedOperation, OperationCompletion } from '../AgentAdapter';
 import { isInside } from '../../navigation/pathSafety';
-import { diffStats } from '../../review/unifiedDiff';
+import { diffStats, createUnifiedDiff } from '../../review/unifiedDiff';
 import { analyzeFileChange } from '../../analysis/changeAnalysis';
 import { AffectedFunction, ChangedRange } from '../../types/events';
 import { CommandAction, ThreadItem } from './protocol';
@@ -165,7 +165,13 @@ export class CodexItemMapper {
     let removed = 0;
     const allRanges: ChangedRange[] = [];
     const allFunctions: AffectedFunction[] = [];
-    const changes = (it.changes ?? []).map((c) => {
+    const changes = (it.changes ?? []).map((raw) => {
+      // For added/deleted files Codex reports the file content, not a unified diff.
+      const k = raw.kind?.type ?? 'update';
+      const isHunked = /^@@ /m.test(raw.diff ?? '');
+      const c = !isHunked && (k === 'add' || k === 'delete') && raw.diff !== undefined
+        ? { ...raw, diff: (k === 'add' ? createUnifiedDiff('', raw.diff) : createUnifiedDiff(raw.diff, '')) ?? '' }
+        : raw;
       const stats = diffStats(c.diff ?? '');
       added += stats.added;
       removed += stats.removed;

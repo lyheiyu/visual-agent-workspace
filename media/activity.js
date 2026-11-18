@@ -39,6 +39,15 @@
   const act = (action, operationId) => send({ type: 'action', action, operationId });
 
   let lastSelected = /** @type {string|undefined} */ (undefined);
+  /** Per-panel UI state: expanded step, open "…" menu, turn groups the user toggled. */
+  const ui = Object.assign({ expanded: undefined, menu: undefined, turns: {} }, ((vscode.getState && vscode.getState()) || {}).ui || {});
+  const saveUi = () => {
+    try {
+      vscode.setState({ ...((vscode.getState && vscode.getState()) || {}), ui: { expanded: ui.expanded, turns: ui.turns } });
+    } catch {
+      /* state is a convenience only */
+    }
+  };
   let conversationOpen = false;
   /** @type {Record<string,string>} */
   let STR = {};
@@ -57,6 +66,20 @@
     }
     sel.addEventListener('change', () => send({ type: 'setLanguage', value: sel.value }));
     return sel;
+  }
+
+  /** "Writes files" label with the static reasons as tooltip. @param {any} c */
+  function writesPill(c) {
+    return c && c.writes ? el('span', { class: 'pill writes', text: S('c.writes'), title: S('c.heuristicTip') + ': ' + c.writeReasons.join('; ') + (c.writeTargets.length ? ' → ' + c.writeTargets.join(', ') : '') }) : null;
+  }
+  /** Full original command; long commands and embedded code start collapsed. @param {string} command @param {any} c @param {boolean} [open] */
+  function fullCommand(command, c, open) {
+    const d = el('details', { class: 'full-command' }, [
+      el('summary', { text: c && (c.long || c.embeddedCode) ? S(c.embeddedCode ? 'c.fullCommandCode' : 'c.fullCommand') + ' · ' + S('c.chars', { n: command.length }) : S('c.fullCommand') }),
+      el('pre', { class: 'mono', text: command }),
+    ]);
+    if (open || !(c && (c.long || c.embeddedCode))) /** @type {HTMLDetailsElement} */ (d).open = true;
+    return d;
   }
 
   /** @param {any} m */
@@ -164,36 +187,69 @@
       app.appendChild(
         el('section', { class: 'approval', attrs: { role: 'alert' } }, [
           el('div', { class: 'approval-title', text: allWaiting.length > 1 ? S('a.approvalNeededN', { n: allWaiting.length }) : S('a.approvalNeeded') }),
-          el('div', { text: waiting.description }),
+          el('div', {}, [el('span', { text: waiting.cmd ? waiting.cmd.summary : waiting.description }), waiting.cmd && el('span', { text: ' ' }), writesPill(waiting.cmd)]),
+          waiting.cmd && !waiting.cmd.writes && el('div', { class: 'muted small', text: S('c.noWriteDetected') }),
+          waiting.cmd && fullCommand(waiting.description.replace(/^(Run tests|Run): /, ''), waiting.cmd),
           !waiting.simulated && waiting.type === 'Edit' && el('div', { class: 'small', text: S('a.approveAppliesPatch') }),
           waiting.file && el('div', { class: 'muted small', text: [waiting.file, waiting.fn && `${waiting.fn}()`].filter(Boolean).join(' › ') }),
           el('div', { class: 'btn-row' }, [
             button(S('a.reviewDiff'), () => act('review', waiting.id), { title: S('a.reviewDiffTip') }),
             button(S('a.approve'), () => act('approve', waiting.id), { kind: 'primary' }),
             button(S('a.reject'), () => act('reject', waiting.id), { kind: 'danger' }),
+            !waiting.simulated && waiting.type === 'Edit' && button(S('p.editFirst'), () => act('editProposal', waiting.id), { title: S('p.editFirstTip') }),
+            !waiting.simulated && button(S('p.regenerate'), () => act('regenerate', waiting.id), { title: S('p.regenerateTip') }),
           ]),
         ]),
       );
     }
 
-    // ---- Timeline
-    const list = el('ol', { class: 'timeline', attrs: { 'aria-label': S('a.operations') } });
-    if (!m.operations.length) {
-      list.appendChild(el('li', { class: 'muted empty', text: S('a.noOps') }));
+    // ---- Timeline, grouped by conversation turn. Completed turns start collapsed.
+    const timeline = el('section', { class: 'timeline-section', attrs: { 'aria-label': S('a.operations') } }, [el('h3', { text: S('a.timeline') })]);
+    if (!m.operations.length) timeline.appendChild(el('p', { class: 'muted empty', text: S('a.noOps') }));
+    if (m.hiddenOperationCount > 0) timeline.appendChild(el('p', { class: 'muted small', text: S('a.hiddenOps', { n: m.hiddenOperationCount }) }));
+    const s = m.selected;
+    for (const g of m.turnGroups || []) {
+      const key = `${m.selectedTaskId}:${g.number}`;
+      const group = /** @type {HTMLDetailsElement} */ (el('details', { class: 'turn-group', attrs: { 'data-key': 'turn:' + key } }));
+      group.open = key in ui.turns ? ui.turns[key] : g.open;
+      group.addEventListener('toggle', () => {
+        ui.turns[key] = group.open;
+        saveUi();
+      });
+      const status = g.status ? S('status.' + g.status) : '';
+      group.appendChild(
+        el('summary', { class: 'turn-summary' }, [
+          el('span', { class: 'turn-title', text: g.number ? S('a.turnN', { n: g.number }) : S('a.turnSetup') }),
+          status && el('span', { class: 'muted small', text: ' · ' + status }),
+          el('span', { class: 'muted small', text: ' · ' + S('a.stepsN', { n: g.steps }) }),
+          g.failed > 0 && el('span', { class: 'badge status-failed small', text: S('a.failedN', { n: g.failed }) }),
+          g.pending > 0 && el('span', { class: 'badge status-proposed small', text: S('a.pendingN', { n: g.pending }) }),
+        ]),
+      );
+      const list = el('ol', { class: 'timeline' });
+      for (const o of m.operations.filter((/** @type {any} */ x) => x.turn === g.number)) list.appendChild(stepItem(o, s && s.id === o.id ? s : undefined));
+      group.appendChild(list);
+      timeline.appendChild(group);
     }
-    if (m.hiddenOperationCount > 0) {
-      list.appendChild(el('li', { class: 'muted small', text: S('a.hiddenOps', { n: m.hiddenOperationCount }) }));
-    }
-    for (const o of m.operations) {
-      const selected = m.selected && m.selected.id === o.id;
+    app.appendChild(timeline);
+
+    /** One step: title (toggles brief details), one primary action, "…" for the rest. @param {any} o @param {any} detail */
+    function stepItem(o, detail) {
+      const expanded = ui.expanded === o.id;
       const where = [o.file, o.fn && `${o.fn}()`].filter(Boolean).join(' › ');
-      const row = el(
+      const toggle = () => {
+        ui.expanded = expanded ? undefined : o.id;
+        saveUi();
+        if (!expanded) send({ type: 'select', operationId: o.id, reveal: false });
+        else render(m);
+      };
+      const title = el(
         'button',
         {
-          class: `op ${selected ? 'selected' : ''} ${o.isCurrent ? 'current' : ''} ${o.awaitingApproval ? 'waiting' : ''}`,
-          title: o.file ? S('a.selectOpen') : S('a.select'),
-          attrs: { 'aria-pressed': selected ? 'true' : 'false', 'data-id': o.id, 'data-key': 'op:' + o.id },
-          on: { click: () => send({ type: 'select', operationId: o.id, reveal: true }) },
+          class: 'op-title',
+          title: S('a.toggleDetails'),
+          attrs: { 'aria-expanded': expanded ? 'true' : 'false', 'data-id': o.id, 'data-key': 'op:' + o.id },
+          on: { click: toggle },
         },
         [
           el('div', { class: 'op-top' }, [
@@ -201,118 +257,139 @@
             el('span', { class: `type type-${o.type.toLowerCase()}`, text: S('type.' + o.type) }),
             badge(o.status),
             o.control && el('span', { class: `ctl ctl-${o.control.toLowerCase()}`, text: S('ctl.' + o.control), title: o.control === 'OBSERVED' ? S('a.observedTip') : S('a.interceptedTip') }),
-            el('span', { class: 'time muted', text: o.time }),
+            o.cmd && writesPill(o.cmd),
+            el('span', { class: 'time muted', text: [o.cmd && o.cmd.duration, o.time].filter(Boolean).join(' · ') }),
           ]),
-          el('div', { class: 'op-desc', text: o.description }),
+          el('div', { class: 'op-desc', text: o.cmd ? o.cmd.summary : o.description }),
           where && el('div', { class: 'op-where', text: where }),
-          o.hasCommand && el('div', { class: 'op-where mono', text: o.simulated ? S('a.commandSimulated') : S('a.command') }),
+          o.errorReason && el('div', { class: 'op-error', text: o.errorReason }),
         ],
       );
-      list.appendChild(el('li', {}, [row]));
-    }
-    app.appendChild(el('section', {}, [el('h3', { text: S('a.timeline') }), list]));
-
-    // ---- Details
-    const s = m.selected;
-    if (s) {
-      /** @type {[string, string|undefined][]} */
-      const fields = [
-        [S('f.type'), S('type.' + s.type)],
-        [S('f.status'), S('status.' + s.status)],
-        [S('f.file'), s.file],
-        [S('f.function'), s.fn && `${s.fn}()`],
-        [S('f.lineHint'), s.lineNumber && String(s.lineNumber)],
-        [S('f.time'), s.timestamp],
-        [S('f.rationale'), s.rationale],
-        [S('f.result'), s.resultSummary],
-        [S('f.control'), s.controlExplanation],
-        [S('f.change'), s.change && `${s.change.decision}${s.change.decisionReason ? ` — ${s.change.decisionReason}` : ''}${s.changeCount > 1 ? ` (${S('a.filesOneDecision', { n: s.changeCount })})` : ''}`],
-        [S('f.operationId'), s.id],
-      ];
-      const dl = el('dl', { class: 'fields' });
-      for (const [k, v] of fields) {
-        if (!v) continue;
-        dl.appendChild(el('dt', { text: k }));
-        dl.appendChild(el('dd', { text: v }));
-      }
-
-      const actions = el('div', { class: 'btn-row' }, [
-        s.canReveal && button(S('a.gotoCode'), () => act('reveal', s.id), { title: S('a.gotoCodeTip') }),
-        button(s.canReviewChange ? S('a.reviewDiff') : S('a.reviewDetails'), () => act('review', s.id)),
-        s.command && button(S('a.commandOutput'), () => act('showOutput', s.id)),
-        m.controls.reviewerEnabled && s.canReviewChange && button(S('a.aiReview'), () => act('aiReviewChange', s.id), { title: S('a.aiReviewTip') }),
-        m.controls.reviewerEnabled && s.hasFailedCommand && button(S('a.aiError'), () => act('aiExplainError', s.id), { title: S('a.aiErrorTip') }),
-        button(S('a.export'), () => act('exportContext', s.id), { title: S('a.exportTip') }),
-        s.canApprove && button(S('a.approve'), () => act('approve', s.id), { kind: 'primary' }),
-        s.canReject && button(S('a.reject'), () => act('reject', s.id), { kind: 'danger' }),
+      const primary = primaryButton(o, toggle);
+      const row = el('div', { class: `op ${detail ? 'selected' : ''} ${o.isCurrent ? 'current' : ''} ${o.awaitingApproval ? 'waiting' : ''}` }, [
+        title,
+        el('div', { class: 'op-actions' }, [primary, moreMenu(o)]),
       ]);
+      return el('li', {}, [row, expanded && (detail ? briefDetails(detail) : el('div', { class: 'brief muted small', text: S('a.loading') }))]);
+    }
 
-      const changeInfo =
-        (s.changedLines.length || s.affectedFunctions.length) &&
-        el('div', { class: 'changes' }, [
-          s.affectedFunctions.length > 0 && el('h4', { text: S('a.affectedFunctions') }),
-          ...s.affectedFunctions.map((/** @type {any} */ f) =>
-            el('button', {
-              class: 'link',
-              text: f.label,
-              title: S('a.gotoFunction'),
-              attrs: { 'data-key': 'fn:' + s.id + ':' + f.index },
-              on: { click: () => send({ type: 'gotoFunction', operationId: s.id, index: f.index }) },
-            }),
-          ),
-          s.changedLines.length > 0 && el('h4', { text: S('a.changedLines') }),
-          s.changedLines.length > 0 && el('div', { class: 'small mono', text: s.changedLines.join('\n') }),
-        ]);
-
-      let cmd = null;
-      if (s.command) {
-        const cmdFields = el('dl', { class: 'fields' });
-        /** @type {[string, string|undefined, string][]} */
-        const cf = [
-          [S('f.command'), s.command.command, 'mono'],
-          [S('f.cwd'), s.command.workingDirectory, 'mono'],
-          [S('f.status'), s.command.status, ''],
-          [S('f.exitCode'), s.command.exitCode !== undefined ? String(s.command.exitCode) : undefined, ''],
-          [S('f.started'), s.command.startedAt, ''],
-          [S('f.finished'), s.command.finishedAt, ''],
-        ];
-        for (const [k, v, cls] of cf) {
-          if (!v) continue;
-          cmdFields.appendChild(el('dt', { text: k }));
-          cmdFields.appendChild(el('dd', { class: cls || '', text: v }));
-        }
-        cmd = el('div', { class: 'command' }, [
-          el('h4', {}, [el('span', { text: S('f.command') + ' ' }), s.command.simulated && el('span', { class: 'pill sim', text: S('a.simulated') })]),
-          cmdFields,
-          s.command.stdout && el('details', { attrs: { open: '' } }, [el('summary', { text: s.command.outputCombined ? S('a.outputCombined') : 'stdout' }), el('pre', { text: s.command.stdout })]),
-          s.command.stderr && el('details', {}, [el('summary', { text: 'stderr' }), el('pre', { text: s.command.stderr })]),
-        ]);
+    /** @param {any} o @param {() => void} toggle */
+    function primaryButton(o, toggle) {
+      const inline = () => (ui.expanded === o.id ? undefined : toggle());
+      switch (o.primary) {
+        case 'review':
+          return button(S('a.reviewChanges'), () => act('review', o.id), { kind: 'primary', title: S('a.reviewDiffTip') });
+        case 'diff':
+          return button(S('a.viewDiff'), () => act('review', o.id), { title: S('a.viewDiffTip') });
+        case 'error':
+          return button(S('a.viewError'), inline, { kind: 'danger-outline', title: S('a.viewErrorTip') });
+        case 'command':
+          return button(S('a.viewCommand'), inline, { title: S('a.viewCommandTip') });
+        case 'file':
+          return button(S('a.viewFile'), () => act('reveal', o.id), { title: S('a.gotoCodeTip') });
+        case 'result':
+          return button(S('a.viewResult'), inline, { title: S('a.viewResultTip') });
+        default:
+          return null;
       }
+    }
 
-      const history = el('ol', { class: 'history' });
-      for (const h of s.history) {
-        history.appendChild(
-          el('li', {}, [
-            el('span', { class: 'muted', text: h.timestamp.slice(11, 19) + ' ' }),
-            badge(h.status, 'small'),
-            el('span', { text: ` ${S('a.by')} ${h.actor}${h.note ? `: ${h.note}` : ''}` }),
+    /** Secondary actions. @param {any} o */
+    function moreMenu(o) {
+      const sel = m.selected && m.selected.id === o.id ? m.selected : undefined;
+      const items = [
+        o.file && o.primary !== 'file' && button(S('a.gotoCode'), () => act('reveal', o.id), { title: S('a.gotoCodeTip') }),
+        o.hasChange && o.primary !== 'diff' && o.primary !== 'review' && button(S('a.viewDiff'), () => act('review', o.id)),
+        o.hasCommand && button(S('a.commandOutput'), () => act('showOutput', o.id)),
+        o.hasCommand && button(S('c.copyCommand'), () => send({ type: 'copy', operationId: o.id, what: 'command' }), { title: S('c.copyTip') }),
+        o.hasCommand && button(S('c.copyOutput'), () => send({ type: 'copy', operationId: o.id, what: 'output' }), { title: S('c.copyTip') }),
+        o.hasCommand && m.controls.reviewerEnabled && button(S('c.explain'), () => act('aiExplainCommand', o.id), { title: S('c.explainTip') }),
+        o.hasChange && m.controls.reviewerEnabled && button(S('a.aiReview'), () => act('aiReviewChange', o.id), { title: S('a.aiReviewTip') }),
+        o.errorReason && o.hasCommand && m.controls.reviewerEnabled && button(S('a.aiError'), () => act('aiExplainError', o.id), { title: S('a.aiErrorTip') }),
+        o.awaitingApproval && !o.simulated && o.type === 'Edit' && o.hasChange && button(S('p.editFirst'), () => act('editProposal', o.id), { title: S('p.editFirstTip') }),
+        o.awaitingApproval && !o.simulated && button(S('p.regenerate'), () => act('regenerate', o.id), { title: S('p.regenerateTip') }),
+        button(S('a.export'), () => act('exportContext', o.id), { title: S('a.exportTip') }),
+        button(S('a.fullRecord'), () => act('record', o.id), { title: S('a.fullRecordTip') }),
+      ].filter(Boolean);
+      void sel;
+      const menu = /** @type {HTMLDetailsElement} */ (el('details', { class: 'more', attrs: { 'data-key': 'more:' + o.id } }, [
+        el('summary', { text: '…', title: S('a.moreActions'), attrs: { 'aria-label': S('a.moreActions') } }),
+        el('div', { class: 'menu' }, items),
+      ]));
+      menu.open = ui.menu === o.id;
+      menu.addEventListener('toggle', () => {
+        ui.menu = menu.open ? o.id : ui.menu === o.id ? undefined : ui.menu;
+      });
+      return menu;
+    }
+
+    /** Brief inline details from the selected operation (full record via "…"). @param {any} d */
+    function briefDetails(d) {
+      const box = el('div', { class: 'brief', attrs: { 'aria-label': S('a.detailsAria') } });
+      if (d.canApprove || d.canReject) {
+        box.appendChild(el('div', { class: 'btn-row' }, [
+          d.canReviewChange && button(S('a.reviewChanges'), () => act('review', d.id), { title: S('a.reviewDiffTip') }),
+          d.canApprove && button(S('a.approve'), () => act('approve', d.id), { kind: 'primary' }),
+          d.canReject && button(S('a.reject'), () => act('reject', d.id), { kind: 'danger' }),
+        ]));
+      }
+      if (d.errorReason) {
+        box.appendChild(el('div', { class: 'op-error' }, [el('strong', { text: S('a.errorReason') + ': ' }), el('span', { text: d.errorReason })]));
+      }
+      if (d.command) {
+        const out = [d.command.stdout, d.command.stderr].filter(Boolean).join('\n');
+        const facts = [
+          [S('f.cwd'), d.command.workingDirectory],
+          [S('f.exitCode'), d.command.exitCode !== undefined ? String(d.command.exitCode) : undefined],
+          [S('f.duration'), d.cmd && d.cmd.duration],
+        ].filter((x) => x[1]);
+        box.appendChild(el('div', { class: 'command' }, [
+          d.cmd && d.cmd.writes && el('div', { class: 'warn small', text: S('c.writesDetail', { reasons: d.cmd.writeReasons.join('; ') }) }),
+          d.cmd && !d.cmd.writes && el('div', { class: 'muted small', text: S('c.noWriteDetected') }),
+          d.command.simulated && el('span', { class: 'pill sim', text: S('a.simulated') }),
+          fullCommand(d.command.command, d.cmd),
+          el('dl', { class: 'fields' }, facts.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { class: 'mono', text: v })])),
+          out && el('details', { attrs: d.errorReason || out.length < 4000 ? { open: '' } : {} }, [
+            el('summary', { text: (d.command.outputCombined ? S('a.outputCombined') : S('a.output')) + ' · ' + S('c.chars', { n: out.length }) }),
+            el('pre', { text: d.command.stdout || '' }),
+            d.command.stderr && el('pre', { class: 'stderr', text: d.command.stderr }),
           ]),
-        );
+        ]));
+      } else if (d.resultSummary) {
+        const long = d.resultSummary.length > 1500;
+        box.appendChild(el('div', {}, [
+          el('pre', { class: 'result', text: long ? d.resultSummary.slice(0, 1500) + '…' : d.resultSummary }),
+          long && button(S('a.fullRecord'), () => act('record', d.id), { title: S('a.fullRecordTip') }),
+        ]));
       }
-
-      app.appendChild(
-        el('section', { class: 'details', attrs: { 'aria-label': S('a.detailsAria') } }, [
-          el('h3', { text: S('a.details', { n: s.seq }) }),
-          actions,
-          dl,
-          changeInfo,
-          cmd,
-          el('h4', { text: S('a.auditTrail') }),
-          history,
-        ]),
-      );
-    } else if (m.operations.length) {
-      app.appendChild(el('p', { class: 'muted small', text: S('a.selectHint') }));
+      if (d.change) box.appendChild(el('div', { class: 'small' }, [el('strong', { text: S('f.change') + ': ' }), el('span', { text: `${d.change.decision}${d.change.decisionReason ? ` — ${d.change.decisionReason}` : ''}${d.changeCount > 1 ? ` (${S('a.filesOneDecision', { n: d.changeCount })})` : ''}` })]));
+      if (d.affectedFunctions.length || d.changedLines.length) {
+        box.appendChild(el('div', { class: 'changes' }, [
+          ...d.affectedFunctions.map((/** @type {any} */ f) =>
+            el('div', { class: 'fn-row' }, [
+              el('button', { class: 'link', text: f.label, title: S('a.gotoFunction'), attrs: { 'data-key': 'fn:' + d.id + ':' + f.index }, on: { click: () => send({ type: 'gotoFunction', operationId: d.id, index: f.index }) } }),
+              m.controls.reviewerEnabled && el('button', { class: 'link small', text: S('a.explainFunction'), title: S('a.explainFunctionTip'), attrs: { 'data-key': 'fnx:' + d.id + ':' + f.index }, on: { click: () => send({ type: 'explainFunction', operationId: d.id, index: f.index }) } }),
+            ]),
+          ),
+          d.changedLines.length > 0 && el('div', { class: 'small mono muted', text: d.changedLines.join('\n') }),
+        ]));
+      }
+      if (d.rationale) box.appendChild(el('div', { class: 'small muted', text: d.rationale }));
+      // Audit trail stays complete, folded by default.
+      const trail = el('details', { class: 'audit' }, [el('summary', { text: `${S('a.auditTrail')} (${d.history.length})` })]);
+      trail.appendChild(el('div', { class: 'small muted', text: d.controlExplanation }));
+      const history = el('ol', { class: 'history' });
+      for (const h of d.history) {
+        history.appendChild(el('li', {}, [
+          el('span', { class: 'muted', text: h.timestamp.slice(11, 19) + ' ' }),
+          badge(h.status, 'small'),
+          el('span', { text: ` ${S('a.by')} ${h.actor}${h.note ? `: ${h.note}` : ''}` }),
+        ]));
+      }
+      trail.appendChild(history);
+      trail.appendChild(el('div', { class: 'small muted mono', text: `${S('f.operationId')}: ${d.id}` }));
+      box.appendChild(trail);
+      return box;
     }
 
     if (document.scrollingElement) document.scrollingElement.scrollTop = scrollTop;

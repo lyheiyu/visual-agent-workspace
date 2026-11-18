@@ -17,10 +17,12 @@ v0.3 adds function-level live tracking, an optional **Local AI Reviewer** (Ollam
 
 | Layer | What it does | LLM usage |
 |---|---|---|
-| **A. Real-time observer** | Records the agent's real tool events: files, functions (parsed), diffs, commands, output. Updates the timeline and navigates. | **None.** No extra Codex prompts, nothing added to the agent's context, no automatic analysis. |
+| **A. Real-time observer** | Records the agent's real tool events: files, functions (parsed), diffs, commands, output. Updates the timeline and navigates. | **None.** No observer inference calls or automatic analysis. Coding workflow instructions accompany user-requested agent turns. |
 | **B. Local AI Reviewer** (optional) | Explain a function, review a change, impact analysis, explain a failure. | **Only when you click**, only on your local Ollama (`127.0.0.1` by default). No cloud tokens, no Codex quota. Can be disabled completely. |
 
 > Design principle: **Propose → Inspect → Approve/Reject → Execute → Record → Review**
+
+Local coding defaults to a short overall plan, sequential file edits, then validation. Multi-file plans identify file responsibilities, shared interfaces and implementation order; small fixes need only a sentence. Implementation requests proceed after the plan, subject to existing tool approvals. Follow-ups reuse the plan and check actual files. This uses the same Ollama model without a separate planning call. Set `visualAgent.local.workflow` to `direct` to omit the staged workflow. These are model instructions, not a guarantee of model compliance; runtime permissions still enforce access. Codex and Claude prompts are unchanged.
 
 ---
 
@@ -68,6 +70,14 @@ npm run compile
 7. **Summary**: built from the recorded events, not written by a model.
 
 Whether you approve or reject, `validation.py` on disk is never modified.
+
+### Timeline
+
+Agent Activity groups steps by conversation turn. Completed turns start collapsed, while the running turn and any turn awaiting your decision stay open. Your own toggles are remembered.
+
+Each step has **one action** beside it: **Review changes** (pending edit), **View diff**, **View error**, **View command**, **View file** or **View result**. Files and diffs open in the editor. Clicking the step title toggles brief inline details: the full command (collapsed when long), working directory, exit code, output, the error, changed functions, and the decision. Approve and Reject are there too.
+
+Failed steps show a short reason taken from the recorded result or output. Secondary actions sit in **…**: go to code, command output, copy command or output, explain command, AI review, export context, and **Full record (audit trail)**, which opens the complete read-only record. The full audit trail is also folded into each step's details. Nothing here calls a model.
 
 ### Live Tracking and Live Follow
 
@@ -170,7 +180,67 @@ Defaults retain 20 tasks, 200 messages and 100 turn reports per task in VS Code 
 
 Single-model real acceptance (GPU inference in a disposable JS repository): `npm run test:local-conversation`. It refuses to load a second Ollama model and checks explain → approved edit → real test → follow-up → new process/native resume with a remembered marker. Set `VAW_CONVERSATION_MODEL` to use another installed tool-capable model.
 
-## Multi-agent coding (v0.4)
+## Clickable code references and Explain Code in Detail
+
+### File references in conversations
+
+Agent replies in **Conversations** are rendered as Markdown (headings, lists, tables, code spans, fenced code, block quotes and links). File references in them are clickable:
+
+| Written by the agent | Opens |
+|---|---|
+| `mujoco_optimizer.py:167`, `a.py:12:5`, `src/x.ts#L4C2`, `x.ts#L10-L20` | that file at the line (and column); a range is highlighted |
+| `[mujoco_optimizer.py:167](C:/D/projects/Orca robot hand/orca sim/…/mujoco_optimizer.py:167)` | absolute Windows path with spaces (Markdown link destinations may contain spaces) |
+| `src/orca_sim/mujoco_optimizer.py`, `./x.py`, `file:///C:/a%20b/c.py#L3`, `/c/Users/…` (Git Bash) | relative, file URL and MSYS paths |
+| ```python scripts/run.py --cfg conf/a.yaml:3``` | the paths inside a code span, not the command |
+
+**Resolution:** absolute paths open directly. Relative paths are tried first in the conversation's project, then in the other workspace roots (a match in the conversation's project wins). A bare filename or a path written relative to another folder is found by a bounded path-suffix search that skips `node_modules`, `.git`, virtual envs and build folders. Several matches open a picker; nothing is guessed. A missing file shows *File not found* inline and nothing is created. A file outside the open folders asks for confirmation first (or follows `visualAgent.allowNavigationOutsideWorkspace`). A line past the end of the file opens the last line with a notice.
+
+**Clicking** opens the file in another editor group, so the conversation stays visible. The target line is revealed, the cursor is placed, and the line is highlighted. **Right-click** a reference for **Open Reference to the Side**, **Copy Reference** and **Explain Code in Detail**. Middle-click also opens to the side.
+
+**Not references:** numbers, times, versions (`v0.4`, `3.14`, `12:30`), `Node.js`, `np.linalg.norm`, a bare `config.json` in prose (it is clickable in a code span or with a line number), URLs, and anything inside fenced code blocks.
+
+**Safety:** the extension host parses Markdown into a whitelisted tree. The webview builds DOM nodes with `textContent` only, so raw HTML in agent output is shown as text. Links never navigate the webview. `javascript:`, `command:`, `vscode:` and `data:` links render as plain text. External `http(s)`/`mailto` links open only after a confirmation dialog. Clicking a reference sends only `{path, line, column}`. The host validates it again and its only effect is opening a text editor; it never runs a command. Stored messages are not modified.
+
+### Explain Code in Detail (local Ollama)
+
+Entry points (all run only when you click):
+
+- the editor context menu: **Explain Code in Detail (Local AI)**;
+- a file reference in a conversation (right-click);
+- **Explain** next to each changed function in Agent Activity (function-level navigation);
+- **Explain in detail…** in the Local AI Reviewer panel;
+- the command palette.
+
+Choose the **scope**:
+- **Selected code**: the selected lines.
+- **Function / class**: the innermost function, method or class containing the line. It uses the language server, falling back to the built-in Python/TS/JS parser.
+- **Entire file.**
+
+Choose the **mode** in the panel:
+- **Structured**: 7 fixed sections. Purpose; inputs/outputs; execution flow; important functions, classes and dependencies; algorithms and math; errors, edge cases and assumptions; relationships with other components.
+- **Line by line**: sections headed `Lines A–B: title`, in source order, using the real line numbers.
+
+Every claim is labelled **[Fact]** (visible in the code), **[Inference]** or **[Issue]**.
+
+The panel opens beside the source editor. It shows:
+- the file, scope, analyzed lines, model, document version and SHA-256 of the analyzed text;
+- a model picker and a mode selector. Switching mode shows an earlier result for the same code, or waits for **Explain**; it never runs the model by itself;
+- **Re-run**, which bypasses the cache, plus **Cancel**, **Copy** and **Export .md**;
+- expandable sections with clickable line ranges. "Lines X–Y" mentions inside the text are clickable too.
+
+Line ranges outside the analyzed code are shown as *outside the analyzed lines (not linked)*. Lines the model skipped in line-by-line mode are listed as *Not covered by the model*.
+
+**Large code:** code is split at function/class boundaries from the existing parser into parts that fit the local context. The budget is about half of `visualAgent.reviewer.contextWindow`, capped by `maxContextChars`. Each part carries its enclosing class/function signatures, the file's imports and the module definitions it uses. Structured mode adds one combining request when there are several parts. At most `visualAgent.reviewer.explainMaxParts` parts (default 8) are analyzed. If more would be needed, the panel, the prompt and the export all say **partial analysis** and list the lines that were **not** analyzed.
+
+**Grounding and accuracy:**
+- Only the target code, its enclosing signatures, imports and used module-level definitions, and (for a function) up to 8 call-site snippets found by local text search are sent. Unrelated files are not.
+- Secrets are redacted.
+- Unsaved editor contents are analyzed as shown and labelled as such.
+- Editing or reloading the file after the analysis shows a **stale** warning, based on the hash of the analyzed text. Line navigation still works but warns.
+- The explanation never writes the source file. Export refuses to overwrite it.
+- Requests use the Local AI Reviewer's service: the same loopback-only endpoint check, model list, inference guard against loading a second model while the local coding agent is busy, cancellation and read-only guarantees.
+- There is no cloud fallback. Agent observation never triggers it.
+
 
 **Start a task:** click **▶ New agent task…** in Agent Activity (or run *Visual Agent: New Agent Task…*). The panel asks for:
 
@@ -221,6 +291,66 @@ The **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`, the Claude Code harn
 The **coding model** (New Agent Task) and the **reviewer model** (Local AI Reviewer dropdown) are separate settings. Changing the reviewer model never touches a running coding session, and the reviewer stays read-only. For example: a local agent on `qwen3.8:27b`, reviewed with `gpt-oss:20b`.
 
 ---
+
+## Reviewing work: files, commands, proposals and your own edits
+
+### Explain this file
+
+**Explain This File (Local AI)** is in the Explorer context menu, the editor title bar (book icon) and the editor context menu. It runs a structured explanation of the whole file, with these sections:
+- **Purpose**
+- **Execution flow**
+- **Dependencies**: what the file imports, plus the project files that import it, found by a local text search whose results are sent as snippets only.
+- **Modification impact**
+- **Risks**
+
+Long files are split into parts with expandable sections (see *Explain Code in Detail*). Explaining a function stays a secondary action. Use **Explain a function in this file…** in the panel, or **Explain Selection / Function in Detail…** in the editor menu. A function's explanation starts with its **role within the project** (callers, importers) and ends with its modification impact. Nothing runs until you click.
+
+### Commands in Agent Activity
+
+Each command row shows:
+- a short **purpose**, e.g. *Run tests (pytest)*, *Install/change packages (npm)*, *Write app.py (cat)*, *Git commit*;
+- the status, the recorded **duration** and the exit code;
+- a **WRITES FILES (detected)** label when the command text shows that it creates, modifies or deletes files.
+
+The label is a **heuristic**. A command *without* it may still change files, for example a script, build tool or program that writes internally. Details and approval prompts for unlabelled commands say so explicitly.
+
+Purpose and write label come from the command text only (redirection, `tee`, `sed -i`, `rm/mv/cp`, installs, git, PowerShell writers, inline scripts). Status, duration and exit code come from the recorded tool result. No model is involved.
+
+The row never contains the full command. Click it for:
+- the **full original command**. It is collapsed when long or when it contains embedded code (here-documents, `python -c`, multi-line).
+- the working directory, exit code and output.
+- **Copy command** and **Copy output**, which copy the original recorded text.
+- **Explain command**: an on-demand local-model explanation of purpose, reads, writes and risks. The command is never executed.
+
+Approval prompts (sidebar and conversation) show the same summary and label, with the full command collapsed.
+
+### Review before writing
+
+An edit the agent proposes is shown as a diff before anything is written; the local agent and Codex block the write until you decide. The approval card (conversation and sidebar) offers:
+
+| Action | What happens |
+|---|---|
+| **Accept** | First checks that the file is exactly as it was when the diff was computed. If it changed on disk, has unsaved editor edits, was created or deleted, approval is **blocked**: nothing is written, the card shows the conflict, and *Regenerate with feedback* is offered. |
+| **Reject** | Declines; an optional reason is recorded. |
+| **Edit before applying** | Opens an editable copy of the proposed version beside the original snapshot. Nothing is written until **Apply my version**, which repeats the conflict check, writes your version, and declines the agent's own write with a message telling it you applied your version and that it must re-read the file. The write is recorded as your operation. |
+| **Regenerate with feedback** | Declines with your feedback (the composer text, or a prompt). The local agent receives it and proposes again in the same turn. |
+
+**While a change is generated:** with OpenCode + Ollama, the edit's content arrives only when it is complete, together with the approval request. Until then the conversation shows **Generating a proposed change… review available when complete**, and the Agent Activity status says *Generating a proposed change; review when complete*. If a runtime streams the edit, the text is shown read-only as a live preview. Editing is enabled only once the proposal is complete.
+
+**Before any write, your manual edits are protected too.** Accept (and Apply my version) is blocked when the proposal would remove lines you added, or bring back lines you deleted, since the agent's last applied version. This is the case of an agent writing a whole file from stale memory. A shell command whose detected write target has your manual or unsaved edits is blocked the same way. This command check is heuristic, from the command text.
+
+**Codex** cannot take a message in its approval reply. When you reject with a reason, regenerate with feedback, or apply your own version, the reason is sent to the same Codex turn right after the decline, with `turn/steer` and `expectedTurnId`. The timeline records whether it was delivered. If the turn had already ended, it is recorded as **not delivered**.
+
+### Your own edits: Check my changes / Continue from my changes
+
+After an agent edit is applied, Visual Agent stores the file's actual content as the agent's version. These baselines are kept in VS Code's workspace storage (never in the project) and **survive window reloads**. Your manual edits are the diff from that version to the file now.
+
+- **Check my changes** sends those diffs in the same conversation and asks the agent to read the latest files and review your edits. It must not modify anything in that turn.
+- **Continue from my changes** sends the diffs with rules, and the composer text becomes the next step. The rules: read the latest version of every file before changing it, keep your edits, continue, then validate the final version on disk and report the actual results.
+
+After that turn, Visual Agent **checks the actual files itself**. For each of your hunks it verifies that the added lines are still present and deleted lines haven't come back. The result is recorded as a *Manual edits check* operation (✔ / ✖ per file) and shown in the conversation.
+
+Unsaved edits must be saved first, because the agent reads from disk. Both actions are also commands (**Check My Changes**, **Continue from My Changes**).
 
 ## Codex mode (v0.2)
 
@@ -393,8 +523,11 @@ The controller still owns every decision, the pending-approval list (now several
 ## Tests and validation
 
 ```bash
-npm test                  # 93 unit tests (Node test runner; no VS Code, Codex or Ollama needed)
-npm run test:integration  # 19 end-to-end tests in a real Extension Development Host (uses a fake local Ollama)
+npm test                  # 146 unit tests (Node test runner; no VS Code, Codex or Ollama needed)
+npm run test:integration  # 31 end-to-end tests in a real Extension Development Host (uses a fake local Ollama / OpenCode)
+npm run test:ollama:explain # REAL local model (opt-in): line-by-line (中文), structured, chunked file; checks line ranges
+npm run test:acceptance   # REAL VS Code host + OpenCode + Ollama in a disposable project: explain file, conflict block, regenerate, edit-before-apply, continue from manual edits, command details/copy/explain
+node scripts/run-codex-decline-real.js   # REAL Codex (uses quota): a declined patch's reason reaches Codex and it re-proposes
 npm run test:ollama       # REAL local models (opt-in; uses GPU/RAM): explain, review, cancel per model
 npm run test:ollama:i18n  # REAL local model (opt-in): 中文 / English / bilingual answers, translation, cache, cancel
 npm run test:local-agent  # REAL local coding agent (OpenCode + Ollama) in disposable repos: analysis, edit+approval, test, stop
@@ -493,6 +626,7 @@ An earlier exploratory trace with `qwen3:8b` (approving everything automatically
 Done in v0.2: Codex App Server adapter, with real approvals, interrupt, steering, and observe/intercept labeling.
 Done in v0.3: function-level change tracking, the Local AI Reviewer (Ollama), review-context export, and normalized provider events.
 Done in v0.4: New Agent Task (provider, model, effort, workspace, profile); explicit Codex model selection; local coding agent through OpenCode + Ollama; experimental Claude Code adapter (Agent SDK); multi-turn sessions.
+Done in v0.5: clickable file references in conversations; Explain Code in Detail (selection / function-class / file, structured or line by line, chunked, stale-aware).
 
 1. **Multi-turn Codex sessions.** Continue a thread with follow-up turns after the first completes (today one task = one turn).
 2. **Claude Code write validation.** Subscription read-only and follow-up are validated; run the edit/command approval flows live before promoting the integration from experimental.
@@ -503,6 +637,14 @@ Done in v0.4: New Agent Task (provider, model, effort, workspace, profile); expl
 
 ## Known limitations
 
+- **Command summaries and the WRITES FILES label** are static heuristics from the command text: a script that writes files internally (`python build.py`) is not labelled, and quoted `>` characters can cause a false label. Use **Explain command** for a closer look.
+- **Review before writing:** *Apply my version* supports one file per proposal; multi-file Codex patches can be accepted or rejected (with feedback) as a whole. Codex is not sent the explanation text when its patch is declined. Conflict checks compare against the snapshot read when the proposal arrived; changes made in the instant between that read and the agent's own read are not detectable.
+- **Manual changes:** baselines exist only for files an agent edited (or you applied) in a recorded conversation, and are dropped when history is cleared. The manual-edit protection is line-based (trimmed): it cannot tell whether a moved or reformatted edit is semantically the same, and it cannot protect edits from commands whose write targets are not visible in the command text.
+- **Live preview** depends on the runtime streaming tool arguments; OpenCode + Ollama did not in real runs, so only the "generating" state is shown.
+- **Codex in read-only sandboxes** may decline to propose a patch at all ("the workspace is read-only") unless told that patches are reviewed. Observed with `gpt-6.2-sol`.
+- **Demo fixture:** `demo-workspace/` is also the first folder of the F5 development workspace. Real agent sessions run there can modify it, which breaks fixture-based tests. Use a separate project for real agent sessions.
+- **References:** relative paths with spaces are recognised in Markdown links and code spans, not in plain prose (where they can't be told apart from a sentence); absolute paths with spaces in prose are recognised when the file name itself has no space. Python traceback lines (`File "x.py", line 12`) and references inside fenced code blocks are not linked. References are linked in the Conversations panel and explanation panel, not in the Agent Activity sidebar.
+- **Explain Code in Detail:** output is model-generated and unverified; [Fact]/[Inference]/[Issue] labels are the model's own. Small models may produce malformed headings (cleaned where possible), overlapping ranges, or skip lines (reported as *Not covered*). Chunking is syntax-aware for Python and TS/JS; other languages are split by lines with blank-line boundaries. Explanations are kept for the current window session only (export to keep them).
 - **Local agent memory:** OpenCode talks to Ollama's OpenAI-compatible endpoint, which can't set `num_ctx`. `visualAgent.local.contextLimit` bounds what OpenCode *sends*, but Ollama still allocates its own default context. Observed: `qwen3:8b` at 40,960 tokens and 11.2 GB, `qwen3.8:27b` at 262,144 tokens and **32.5 GB**. To reduce this, set `OLLAMA_CONTEXT_LENGTH` for your Ollama server yourself; Visual Agent doesn't change Ollama's configuration.
 - **Local agent quality** depends on the model. Small models can produce broken edits or leak reasoning text. Review diffs before approving.
 - **Claude Code:** experimental integration. Subscription read-only and follow-up are live-tested; edit/command permission flows have fixture coverage. Restarted Claude conversations still use saved-context continuation rather than native session restoration.

@@ -2,6 +2,7 @@ import { resolveStrings, translator, Translator, UiLanguage } from '../i18n/i18n
 import { ControllerSnapshot } from '../controller/AgentController';
 import { EventRecorder } from '../recorder/EventRecorder';
 import { conversation } from '../recorder/conversation';
+import { describeCommand, durationMs, formatDuration } from '../analysis/commandInfo';
 import {
   AgentOperation,
   ChangeRecord,
@@ -58,8 +59,24 @@ export interface ActivityViewModel {
   hiddenOperationCount: number;
   conversation: Array<{ role: 'user' | 'assistant'; text: string; timestamp: string }>;
   turns: NonNullable<import('../types/events').TaskRecord['turns']>;
+  /** Timeline groups, newest last. Completed turns start collapsed (the webview remembers toggles). */
+  turnGroups: TurnGroup[];
   selected?: OperationDetail;
 }
+
+export interface TurnGroup {
+  /** 0 = steps recorded before the first turn (or tasks without turns). */
+  number: number;
+  status?: 'Running' | 'Completed' | 'Stopped' | 'Failed';
+  steps: number;
+  failed: number;
+  pending: number;
+  /** Default open state: running turns and turns with pending approvals or failures in the live turn. */
+  open: boolean;
+}
+
+/** Primary action shown beside a step (derived from the recorded operation). */
+export type PrimaryAction = 'review' | 'diff' | 'error' | 'command' | 'file' | 'result';
 
 /** Max operations rendered in the timeline; older ones stay in history. */
 export const MAX_RENDERED_OPERATIONS = 300;
@@ -79,6 +96,14 @@ export interface OperationRow {
   hasCommand: boolean;
   /** Explicit observe-vs-intercept label (empty for ordinary mock steps). */
   control: '' | 'OBSERVED' | 'INTERCEPTED' | 'GATED';
+  /** Commands: short purpose (static, from the command text), write label and recorded duration. */
+  /** Conversation turn this step belongs to (0 = before the first turn). */
+  turn: number;
+  primary?: PrimaryAction;
+  /** Failed steps: a short reason from the recorded result/output (no model). */
+  errorReason?: string;
+  hasChange: boolean;
+  cmd?: { summary: string; writes: boolean; writeTargets: string[]; writeReasons: string[]; long: boolean; embeddedCode: boolean; short: string; duration?: string; exitCode?: number };
 }
 
 export interface OperationDetail extends OperationRow {
@@ -104,6 +129,81 @@ export interface OperationDetail extends OperationRow {
   canReveal: boolean;
 }
 
+/** Primary action and short error reason, from the recorded operation only. */
+export function stepActions(op: AgentOperation, awaiting: boolean): Pick<OperationRow, 'primary' | 'errorReason' | 'hasChange'> {
+  const hasChange = !!(op.associatedChangeId || op.associatedChangeIds?.length);
+  const errorReason = failureReason(op);
+  const primary: PrimaryAction | undefined = awaiting && hasChange
+    ? 'review'
+    : errorReason
+      ? 'error'
+      : hasChange
+        ? 'diff'
+        : op.command
+          ? 'command'
+          : op.filePath
+            ? 'file'
+            : op.resultSummary
+              ? 'result'
+              : undefined;
+  return { primary, errorReason, hasChange };
+}
+
+/** Short reason for a failed step: exit code + the most telling output line, else the first result line. */
+export function failureReason(op: AgentOperation): string | undefined {
+  const exit = op.command?.exitCode ?? op.exitCode;
+  const commandFailed = !!op.command && exit !== undefined && exit !== 0;
+  if (op.status !== 'Failed' && !commandFailed) return undefined;
+  const clip = (t: string) => (t.length > 140 ? t.slice(0, 139) + '…' : t);
+  if (op.command) {
+    const lines = [op.command.stderr, op.command.stdout].filter(Boolean).join('\n').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const telling = [...lines].reverse().find((l) => /error|exception|failed|failure|assert|traceback|not found|denied|cannot|refused/i.test(l)) ?? lines.at(-1);
+    return clip(`${exit !== undefined ? `exit ${exit}` : 'failed'}${telling ? `: ${telling}` : ''}`);
+  }
+  const first = (op.resultSummary ?? '').split(/\r?\n/).map((l) => l.trim()).find(Boolean);
+  return clip(first ?? 'Failed');
+}
+
+function groups(rows: OperationRow[], turns: NonNullable<import('../types/events').TaskRecord['turns']>): TurnGroup[] {
+  const out = new Map<number, TurnGroup>();
+  const last = rows.length ? rows[rows.length - 1].turn : 0;
+  for (const r of rows) {
+    let g = out.get(r.turn);
+    if (!g) {
+      const t = turns.find((x) => x.number === r.turn);
+      g = { number: r.turn, status: t?.status, steps: 0, failed: 0, pending: 0, open: false };
+      out.set(r.turn, g);
+    }
+    g.steps++;
+    if (r.status === 'Failed') g.failed++;
+    if (r.awaitingApproval) g.pending++;
+  }
+  for (const g of out.values()) {
+    // Collapse completed turns; keep running ones, ones awaiting a decision, and untracked groups open.
+    g.open = g.pending > 0 || g.status === 'Running' || (g.status === undefined && (g.number === last || turns.length === 0));
+  }
+  return [...out.values()].sort((a, b) => a.number - b.number);
+}
+
+/** Static command facts plus duration from the recorded timestamps (command times, else status history). */
+function commandRow(op: AgentOperation): OperationRow['cmd'] {
+  const info = describeCommand(op.command!.command);
+  const running = op.history.find((h) => h.status === 'Running')?.timestamp;
+  const ended = [...op.history].reverse().find((h) => ['Completed', 'Failed', 'Cancelled'].includes(h.status))?.timestamp;
+  const ms = durationMs(op.command!.startedAt, op.command!.finishedAt) ?? durationMs(running, ended);
+  return {
+    summary: info.summary,
+    writes: info.writes,
+    writeTargets: info.writeTargets,
+    writeReasons: info.writeReasons,
+    long: info.long,
+    embeddedCode: info.embeddedCode,
+    short: info.short,
+    duration: formatDuration(ms),
+    exitCode: op.command!.exitCode ?? op.exitCode,
+  };
+}
+
 export function buildActivityViewModel(
   recorder: EventRecorder,
   snapshot: ControllerSnapshot,
@@ -119,6 +219,12 @@ export function buildActivityViewModel(
   const active = snapshot.taskStatus === 'Running';
   const isLive = active && snapshot.taskId === selectedTaskId;
 
+  const turns = task?.turns ?? [];
+  const turnOf = (seq: number) => {
+    let n = 0;
+    for (const t of turns) if (t.firstSequence <= seq) n = t.number;
+    return n;
+  };
   const row = (op: AgentOperation): OperationRow => ({
     id: op.operationId,
     seq: op.sequenceNumber,
@@ -133,8 +239,12 @@ export function buildActivityViewModel(
     isCurrent: isLive && snapshot.currentOperationId === op.operationId,
     hasCommand: !!op.command,
     control: controlLabel(op),
+    cmd: op.command ? commandRow(op) : undefined,
+    turn: turnOf(op.sequenceNumber),
+    ...stepActions(op, isLive && snapshot.pendingApprovals.includes(op.operationId)),
   });
 
+  const rendered = ops.slice(-MAX_RENDERED_OPERATIONS).map(row);
   const selectedOp = ops.find((o) => o.operationId === ui.selectedOperationId);
   let selected: OperationDetail | undefined;
   if (selectedOp) {
@@ -198,7 +308,8 @@ export function buildActivityViewModel(
     selectedTaskId,
     language: lang,
     strings: resolveStrings(lang),
-    operations: ops.slice(-MAX_RENDERED_OPERATIONS).map(row),
+    operations: rendered,
+    turnGroups: groups(rendered, turns),
     hiddenOperationCount: Math.max(0, ops.length - MAX_RENDERED_OPERATIONS),
     conversation: task ? conversation(task, ops).slice(-20).map((m) => ({ ...m, text: m.text.length > 4000 ? m.text.slice(0, 4000) + '\n[…] — 查看对话历史 / Open conversation history' : m.text })) : [],
     turns: task?.turns ?? [],
@@ -246,6 +357,9 @@ function headerStatus(
         : { statusLabel: tr('state.waiting'), statusKind: 'waiting' };
     }
     if (s.awaitingInput) return { statusLabel: tr('state.ready'), statusKind: 'idle' };
+    if (!s.paused && s.preview) return { statusLabel: tr('state.generatingEdit'), statusKind: 'running' };
+    if (!s.paused && s.progress?.phase === 'thinking') return { statusLabel: tr('state.thinking'), statusKind: 'running' };
+    if (!s.paused && s.progress?.phase === 'answering') return { statusLabel: tr('state.answering'), statusKind: 'running' };
     return s.paused ? { statusLabel: tr('state.paused'), statusKind: 'paused' } : { statusLabel: tr('state.running'), statusKind: 'running' };
   }
   const status = s.taskStatus === 'Idle' ? historicStatus : s.taskStatus;

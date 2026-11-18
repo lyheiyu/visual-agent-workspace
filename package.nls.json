@@ -56,5 +56,15 @@
   "config.local.opencodePath": "Path to the native OpenCode binary (opencode / opencode.exe). Empty = auto-detect (extension, global npm opencode-ai, PATH). Shell scripts are not accepted.",
   "config.local.ollamaEndpoint": "Ollama endpoint used by the local coding agent. Empty = the Local AI Reviewer endpoint. Only local inference is configured.",
   "config.local.contextLimit": "Context size (tokens) the local agent may use; capped by the model's own limit. Ollama allocates memory for the context it loads.",
-  "config.local.outputLimit": "Maximum output tokens per local agent response."
+  "config.local.outputLimit": "Maximum output tokens per local agent response.",
+  "cmd.openReference": "Open Reference",
+  "cmd.openReferenceToSide": "Open Reference to the Side",
+  "cmd.copyReferencePath": "Copy Reference",
+  "cmd.explainCodeInDetail": "Explain Selection / Function in Detail (Local AI)…",
+  "cmd.explainCancel": "Cancel Code Explanation",
+  "config.reviewer.explainMaxParts": "Explain Code in Detail: maximum number of parts (one local request each) a large file or class is split into. Code beyond the limit is reported as not analyzed.",
+  "cmd.reviewer.explainCommand": "Explain Command (Local AI, not executed)",
+  "cmd.explainFile": "Explain This File (Local AI)",
+  "cmd.checkMyChanges": "Check My Changes (ask the agent)",
+  "cmd.continueFromMyChanges": "Continue from My Changes"
 }

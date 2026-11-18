@@ -35,6 +35,8 @@ export interface ReviewRequest {
   truncated: boolean;
   /** Language the model was asked to answer in. */
   language?: ResponseLanguage;
+  /** Explicit re-run: ask the model again instead of returning a cached answer. */
+  noCache?: boolean;
 }
 
 export interface ReviewResult {
@@ -173,7 +175,7 @@ export class ReviewService {
       throw new Error(this.state.error ?? 'No local model is available.');
     }
     const key = cacheKey(model, req, this.options.thinking());
-    const hit = this.cache.get(key);
+    const hit = req.noCache ? undefined : this.cache.get(key);
     if (hit) {
       const cached: ReviewResult = { ...hit, id: randomUUID(), cached: true, subject: req.subject, title: req.title, translations: { ...hit.translations }, view: 'original' };
       this.pushHistory(cached);

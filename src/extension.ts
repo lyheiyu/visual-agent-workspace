@@ -25,6 +25,9 @@ import * as path from 'node:path';
 import { isInside } from './navigation/pathSafety';
 import { findEnclosingFunction } from './navigation/symbolSearch';
 import { selectProjectRoot, PROJECT_TRANSFER_KEY, ProjectTransfer } from './navigation/ProjectWorkspace';
+import { ReferenceNavigator } from './references/ReferenceNavigator';
+import { ExplainController } from './reviewer/ExplainController';
+import { ManualChanges } from './review/ManualChanges';
 
 const HISTORY_KEY = 'visualAgent.history.v1';
 
@@ -49,6 +52,8 @@ export interface VisualAgentApi {
   exporter: ExportController;
   controls: HumanControlManager;
   launcher: AgentLauncher;
+  explainer: ExplainController;
+  manual: ManualChanges;
 }
 
 export function activate(context: vscode.ExtensionContext): VisualAgentApi {
@@ -79,6 +84,16 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
   });
 
   const navigator = new CodeNavigator(log);
+  // Clickable file references in conversations/explanations (opens editors only; never runs anything).
+  const references = new ReferenceNavigator(
+    navigator,
+    (taskId) => {
+      const task = taskId ? recorder.getTask(taskId) : undefined;
+      return task?.workspaceRoot ?? task?.launch?.workspaceRoot;
+    },
+    log,
+  );
+  references.registerCommands();
   const review = new ChangeReviewManager(navigator, log);
   const records = new RecordDocumentProvider(recorder);
   // A fresh adapter (and app-server process) per Codex task.
@@ -122,6 +137,9 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
   });
   const reviewerController = new ReviewerController(reviewer, recorder, review, log, () => controls.getSelection().operationId);
   reviewerController.registerCommands();
+  // Explain Code in Detail: same local reviewer service; runs only on explicit user action.
+  const explainer = new ExplainController(context, reviewerController, references, navigator, log, () => controls.language());
+  explainer.registerCommands();
   const selectionLabel = () => {
     const id = controls.getSelection().operationId;
     const op = id ? recorder.getOperation(id) : undefined;
@@ -161,6 +179,34 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
 
   // ---- v0.4: unified provider/model selection (Codex, Claude Code, local agent)
   const launcher = new AgentLauncher(context, controller, navigator, log, recorder, () => reviewer.getState().busy);
+  // "Check my changes" / "Continue from my changes": same conversation, same coding model.
+  const manual = new ManualChanges(
+    recorder,
+    controller,
+    (taskId, text) => launcher.send(taskId, text),
+    log,
+    controls.proposals.onDidApplyUserVersion,
+    vscode.Uri.joinPath(context.storageUri ?? context.globalStorageUri, 'review-baselines.json'),
+  );
+  controls.proposals.setManualEditGuard(manual);
+  context.subscriptions.push(manual);
+  const manualCommand = (kind: 'check' | 'continue') => async (taskId?: unknown) => {
+    const id = typeof taskId === 'string' && recorder.getTask(taskId) ? taskId : controls.getSelection().taskId;
+    if (!id) return void vscode.window.showInformationMessage('Select a conversation first.');
+    try {
+      const r = kind === 'check' ? await manual.check(id) : await manual.continueFrom(id);
+      if (!r.sent && r.reason) void vscode.window.showInformationMessage(r.reason);
+      if (r.sent) await vscode.commands.executeCommand('visualAgent.openConversations', id);
+      return r;
+    } catch (err) {
+      void vscode.window.showWarningMessage((err as Error).message);
+      return { sent: false, reason: (err as Error).message };
+    }
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('visualAgent.checkMyChanges', manualCommand('check')),
+    vscode.commands.registerCommand('visualAgent.continueFromMyChanges', manualCommand('continue')),
+  );
   if (transfer) {
     const restore = setTimeout(() => {
       if (transfer.selection) NewTaskPanel.show(context.extensionUri, launcher, () => controls.language(), () => reviewer.getState().selectedModel, transfer.selection.provider, transfer.selection);
@@ -178,7 +224,7 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
       }
     }),
     vscode.commands.registerCommand('visualAgent.openConversations', (taskId?: string) => {
-      return ConversationPanel.show(context.extensionUri, recorder, controller, launcher, controls, taskId ?? controls.getSelection().taskId);
+      return ConversationPanel.show(context.extensionUri, recorder, controller, launcher, controls, references, manual, taskId ?? controls.getSelection().taskId);
     }),
     vscode.commands.registerCommand('visualAgent.explainInConversation', async (taskId?: string) => {
       const task = taskId ? recorder.getTask(taskId) : undefined;
@@ -243,6 +289,7 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
     vscode.window.registerWebviewViewProvider(ReviewerViewProvider.viewId, reviewerView),
     reviewerView,
     reviewerController,
+    explainer,
     exporter,
     { dispose: () => reviewer.dispose() },
     commandTree,
@@ -250,12 +297,13 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
     records,
     review,
     navigator,
+    references,
     { dispose: () => controller.dispose() },
     { dispose: () => recorder.dispose() },
   );
 
   log.appendLine('Visual Agent Workspace activated (adapters: mock demo, Codex App Server)');
-  return { controller, recorder, startCodex, reviewer, reviewerController, exporter, controls, launcher };
+  return { controller, recorder, startCodex, reviewer, reviewerController, exporter, controls, launcher, explainer, manual };
 }
 
 export function deactivate(): void {}
