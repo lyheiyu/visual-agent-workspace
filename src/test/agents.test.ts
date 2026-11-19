@@ -9,6 +9,8 @@ import { MockAgentAdapter } from '../adapters/MockAgentAdapter';
 import { OpenCodeAdapter } from '../agents/opencode/OpenCodeAdapter';
 import { buildOpenCodeConfig } from '../agents/opencode/OpenCodeServer';
 import { ClaudeCodeAdapter, claudeAuthFromEnv, SdkQueryFn } from '../agents/claude/ClaudeCodeAdapter';
+import { CODEX_ADD_CONTENT_CASE } from './support/shellFixtures';
+import { SOURCE_EDIT_POLICY } from '../agents/editPolicy';
 import { DESTRUCTIVE_COMMAND, mapToolCall } from '../agents/toolMapping';
 import { discoverOllamaCodingModels } from '../agents/providers';
 import { ReviewService } from '../reviewer/ReviewService';
@@ -503,6 +505,76 @@ test('coding model and reviewer model are independent', async () => {
   const body = fake.requests.find((r) => r.route.endsWith('/prompt_async'))!.body;
   assert.equal(body.model.modelID, 'qwen3:8b', 'coding session keeps its own model');
   assert.equal(reviewer.inferenceRequests, 0);
+  await controller.endSession();
+  await controller.whenIdle();
+});
+
+// ------------------------------------------------------------------ shell source writes
+
+test('local agent: an explicit shell write is blocked with a resubmit message; the normal edit approval and test command still go to the user', async () => {
+  const root = workspace();
+  const fake = new FakeOpenCode();
+  const order: string[] = [];
+  fake.turns = [
+    async (s) => {
+      s.assistant();
+      s.tool('call_w', 'bash', 'running', { command: CODEX_ADD_CONTENT_CASE });
+      order.push('write:' + (await s.permission('per_w', 'bash', 'call_w', { command: CODEX_ADD_CONTENT_CASE })));
+      s.tool('call_w', 'bash', 'error', { command: CODEX_ADD_CONTENT_CASE }, { error: 'rejected' });
+      s.tool('call_e', 'edit', 'running', { filePath: path.join(root, 'math.js'), oldString: 'return a / b;', newString: 'return b === 0 ? NaN : a / b;' });
+      order.push('edit:' + (await s.permission('per_e', 'edit', 'call_e', { filepath: path.join(root, 'math.js'), diff: '@@ -7 +7 @@\n-  return a / b;\n+  return b === 0 ? NaN : a / b;\n' }, ['math.js'])));
+      s.tool('call_t', 'bash', 'running', { command: 'node test.js' });
+      order.push('test:' + (await s.permission('per_t', 'bash', 'call_t', { command: 'node test.js' })));
+      s.idle();
+    },
+  ];
+  const { recorder, controller } = setup(root);
+  const taskId = controller.start('Fix divide', openCode(root, fake, 'approved-write'));
+  let snap = await waitFor(controller, (s) => !!s.awaitingApprovalFor);
+  const edit = recorder.getOperation(snap.awaitingApprovalFor!)!;
+  assert.equal(edit.operationType, 'Edit', 'the shell write never reached the user');
+  assert.ok(edit.associatedChangeId, 'the edit has a reviewable diff');
+  controller.approve(edit.operationId);
+  snap = await waitFor(controller, (s) => !!s.awaitingApprovalFor && s.awaitingApprovalFor !== edit.operationId);
+  const t = recorder.getOperation(snap.awaitingApprovalFor!)!;
+  assert.match(t.history.map((h) => h.note).join(' '), /may create or change files/);
+  controller.approve(t.operationId);
+  await waitFor(controller, (s) => s.awaitingInput);
+  assert.deepEqual(order, ['write:reject', 'edit:once', 'test:once']);
+  const blockReply = fake.replies.find((r: any) => r.id === 'per_w') as any;
+  assert.match(blockReply.message, /^Blocked before execution[\s\S]*file edit \/ patch tool/);
+  const blocked = recorder.getOperations(taskId).find((o) => o.externalId === 'call_w')!;
+  assert.equal(blocked.status, 'Rejected');
+  assert.equal(blocked.command?.status, 'NotRun');
+  assert.equal(fs.readFileSync(path.join(root, 'math.js'), 'utf8'), MATH, 'nothing written by the fake runtime or by us');
+  const prompt = fake.requests.find((r) => r.route.endsWith('/prompt_async'))!.body as any;
+  assert.match(prompt.system, /修改项目文件只能用文件编辑\/写入（补丁）工具/);
+  await controller.endSession();
+  await controller.whenIdle();
+});
+
+test('Claude Code (fixture): an explicit shell write is denied with a resubmit message without asking; the edit rule is appended to the system prompt', async () => {
+  const root = workspace();
+  const results: any[] = [];
+  const q = fakeQuery(async (opts, push) => {
+    push({ type: 'system', subtype: 'init', model: 'claude-sonnet-5-5', session_id: 'cc-w', tools: ['Bash', 'Edit'] });
+    const input = { command: `echo "export const x = 1;" > ${path.join(root, 'x.js')}` };
+    push({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu_w', name: 'Bash', input }] } });
+    await new Promise((r) => setTimeout(r, 10));
+    results.push(await opts.canUseTool('Bash', input, { signal: new AbortController().signal, toolUseID: 'tu_w' }));
+    push({ type: 'result', subtype: 'success', is_error: false });
+  });
+  const adapter = new ClaudeCodeAdapter({ loadQuery: async () => q.fn, model: 'claude-sonnet-5-5', profile: 'approved-write', env: { ANTHROPIC_API_KEY: 'k' } });
+  const { recorder, controller } = setup(root);
+  const taskId = controller.start('Add x', adapter);
+  await waitFor(controller, (s) => s.awaitingInput);
+  assert.equal(results[0].behavior, 'deny');
+  assert.match(results[0].message, /^Blocked before execution[\s\S]*redirection > → [\s\S]*x\.js[\s\S]*file edit \/ patch tool/);
+  const op = recorder.getOperations(taskId).find((o) => o.externalId === 'tu_w')!;
+  assert.equal(op.status, 'Rejected');
+  assert.ok(!op.history.some((h) => h.actor === 'user'));
+  assert.ok(!fs.existsSync(path.join(root, 'x.js')));
+  assert.deepEqual(q.calls[0].systemPrompt, { type: 'preset', preset: 'claude_code', append: SOURCE_EDIT_POLICY });
   await controller.endSession();
   await controller.whenIdle();
 });

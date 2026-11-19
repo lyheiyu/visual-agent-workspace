@@ -1,6 +1,7 @@
 import { AdapterCapabilities, AgentTaskContext, OperationSink, StreamingAgentAdapter, StreamingRunResult } from '../../adapters/AgentAdapter';
 import { NormalizedEventApplier } from '../../adapters/normalizedEvents';
 import { DESTRUCTIVE_COMMAND, insideWorkspace, isSensitive, mapToolCall, readTextSafe, relPath, str } from '../toolMapping';
+import { SOURCE_EDIT_POLICY } from '../editPolicy';
 
 /**
  * Minimal structural types for the parts of @anthropic-ai/claude-agent-sdk we
@@ -157,6 +158,8 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
         ...(this.options.effort ? { effort: this.options.effort } : {}),
         permissionMode: 'default',
         settingSources: [],
+        // Appended to Claude Code's own prompt: source changes via Edit/Write (reviewed as diffs), not Bash.
+        ...(readOnly ? {} : { systemPrompt: { type: 'preset', preset: 'claude_code', append: SOURCE_EDIT_POLICY } }),
         disallowedTools: readOnly
           ? ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch', 'Task', 'Agent']
           : ['WebFetch', 'WebSearch', 'Task', 'Agent'],

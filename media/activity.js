@@ -188,7 +188,7 @@
         el('section', { class: 'approval', attrs: { role: 'alert' } }, [
           el('div', { class: 'approval-title', text: allWaiting.length > 1 ? S('a.approvalNeededN', { n: allWaiting.length }) : S('a.approvalNeeded') }),
           el('div', {}, [el('span', { text: waiting.cmd ? waiting.cmd.summary : waiting.description }), waiting.cmd && el('span', { text: ' ' }), writesPill(waiting.cmd)]),
-          waiting.cmd && !waiting.cmd.writes && el('div', { class: 'muted small', text: S('c.noWriteDetected') }),
+          waiting.cmd && !waiting.cmd.writes && el('div', { class: 'muted small', text: S(waiting.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected') }),
           waiting.cmd && fullCommand(waiting.description.replace(/^(Run tests|Run): /, ''), waiting.cmd),
           !waiting.simulated && waiting.type === 'Edit' && el('div', { class: 'small', text: S('a.approveAppliesPatch') }),
           waiting.file && el('div', { class: 'muted small', text: [waiting.file, waiting.fn && `${waiting.fn}()`].filter(Boolean).join(' › ') }),
@@ -345,7 +345,8 @@
         ].filter((x) => x[1]);
         box.appendChild(el('div', { class: 'command' }, [
           d.cmd && d.cmd.writes && el('div', { class: 'warn small', text: S('c.writesDetail', { reasons: d.cmd.writeReasons.join('; ') }) }),
-          d.cmd && !d.cmd.writes && el('div', { class: 'muted small', text: S('c.noWriteDetected') }),
+          d.cmd && d.cmd.sourceWrite && d.status === 'Rejected' && el('div', { class: 'warn small', text: S('c.blockedWrite') }),
+          d.cmd && !d.cmd.writes && el('div', { class: 'muted small', text: S(d.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected') }),
           d.command.simulated && el('span', { class: 'pill sim', text: S('a.simulated') }),
           fullCommand(d.command.command, d.cmd),
           el('dl', { class: 'fields' }, facts.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { class: 'mono', text: v })])),

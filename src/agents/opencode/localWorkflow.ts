@@ -1,3 +1,5 @@
+import { SOURCE_EDIT_POLICY_ZH } from '../editPolicy';
+
 export type LocalWorkflow = 'plan-files' | 'direct';
 
 /** Stable per-turn instructions, separate from the user's text and audit history. */
@@ -14,6 +16,7 @@ export function localWorkflowPrompt(profile: 'read-only' | 'approved-write', wor
     profile === 'read-only'
       ? '当前是只读模式：只能检查、解释和规划；不要尝试写文件或执行命令。需要实施时明确说明要切换到允许逐项审批的任务。'
       : '当前可逐项审批：需要修改时必须使用实际文件编辑/写入工具，按工具 schema 提交正确参数和真实换行，等待审批和工具结果；不要绕过审批或用命令批量覆盖文件。',
+    ...(profile === 'read-only' ? [] : [SOURCE_EDIT_POLICY_ZH]),
   ];
   if (workflow === 'direct') return common.join('\n');
   return [...common,

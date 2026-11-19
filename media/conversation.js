@@ -136,7 +136,7 @@ ${S('ref.hint')}`,
         title.append(' ', pill);
       }
       item.append(el('strong', S('a.approvalNeeded')), title);
-      if (approval.command && !(approval.cmd && approval.cmd.writes)) item.append(el('p', S('c.noWriteDetected'), 'muted'));
+      if (approval.command && !(approval.cmd && approval.cmd.writes)) item.append(el('p', S(approval.cmd && approval.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected'), 'muted'));
       if (approval.command) {
         const d = el('details');
         d.append(el('summary', S(approval.cmd && approval.cmd.embeddedCode ? 'c.fullCommandCode' : 'c.fullCommand')), el('pre', approval.command));

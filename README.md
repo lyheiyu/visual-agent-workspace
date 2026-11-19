@@ -324,6 +324,18 @@ The row never contains the full command. Click it for:
 
 Approval prompts (sidebar and conversation) show the same summary and label, with the full command collapsed.
 
+### Source changes go through patches, not shell commands
+
+A shell command that writes a file cannot show a diff before it runs. Approving it is approving an unseen change. In a real Codex session (profile *Approve each command and each edit*, Windows), an approved `powershell.exe -Command '… $css = @'…'@; Add-Content -LiteralPath $stylePath …'` wrote `style.css` with no diff. This command was previously labelled *no file write detected*. Visual Agent now closes that path:
+
+- **Every coding agent is told** to make source changes with its file-edit/patch tool (Codex: `developerInstructions` in profiles that can apply patches; Claude Code: appended to its default system prompt; local agent: its system prompt). Those changes keep the normal flow: diff → accept / reject / edit before applying / regenerate.
+- **Explicit shell writes are blocked before execution**, without asking you: PowerShell `Add-Content`, `Set-Content`, `Out-File`, `Tee-Object`, `New-Item -Value`, `[IO.File]::Write*`; `>` / `>>` redirection; `tee`; `sed -i` / `perl -i`; `dd of=`; `git apply` / `patch`; and inline `python -c`, `node -e` or heredoc scripts that open or write files. Nested `powershell -Command`, `-EncodedCommand`, `bash -c` and `cmd /c` scripts are unquoted and checked as well. Here-document and here-string bodies are treated as data. Redirection to `/dev/null`, `$null` or `NUL` is allowed.
+- **The agent is told why** through its normal decline channel (OpenCode reply message, Claude Code deny message, Codex `turn/steer` in the same turn): resubmit the change as an editable patch, and don't retry with another shell writer. The step is recorded as *Rejected*, command *NotRun*, with the detected writer and target.
+- **Tests, builds and installs stay under command approval.** Their approval card says they may create or change files (build output, caches, snapshots, reports) and that no diff is available before they run.
+- **Nothing is executed to find out what a command would write.** Detection reads the command text only. Diffs and conflict checks for patches are computed locally. No model is called; *Explain command* stays on demand.
+
+This is a **heuristic** and does not catch every write. Not detected: writes a program or script does internally (`node scripts/generate.js`, `npm run build`), commands assembled at run time or obfuscated, PowerShell aliases such as `sc` / `ac`, and `cp` / `mv` / `rm` (these still get the **WRITES FILES** label and need approval).
+
 ### Review before writing
 
 An edit the agent proposes is shown as a diff before anything is written; the local agent and Codex block the write until you decide. The approval card (conversation and sidebar) offers:
@@ -372,12 +384,12 @@ The details pane spells out the explanation for the selected operation.
 
 ### Safety profiles
 
-All three profiles use Codex's **read-only sandbox**. Shell commands can never write, even after you approve them; this was verified on Windows, where an approved `Set-Content` failed with *Access to the path … is denied*. The only way a file can change is a Codex patch that you approve in **Approve each command and each edit**.
+All three profiles use Codex's **read-only sandbox** for commands Codex runs without asking. **A command you approve may run outside that sandbox and change files.** An earlier Codex build failed an approved `Set-Content` with *Access to the path … is denied*. On 2026-11-19, an approved `Add-Content` wrote `style.css` (Windows, `gpt-6.2-sol`). Commands that explicitly write files are therefore blocked before you are asked (see *Source changes go through patches*). Reviewable file changes are Codex patches, which you approve in **Approve each command and each edit**.
 
 | Profile | Codex `approvalPolicy` | Commands | Patches (edits) |
 |---|---|---|---|
 | **Observe only** (default) | `on-request` | Run without asking, read-only (**observed**). Escalation requests are declined automatically. | Declined automatically |
-| **Approve each command** | `untrusted` | Codex must ask first (**intercepted**). Approved commands still run read-only. | Declined automatically |
+| **Approve each command** | `untrusted` | Codex must ask first (**intercepted**). Explicit shell writes are blocked; an approved command may still change files indirectly (tests, builds, scripts). | Declined automatically |
 | **Approve each command and each edit** | `untrusted` | As above | Codex must ask first. You see the full diff. **Approving applies that entire patch.** |
 
 Additional safeguards:
@@ -523,7 +535,7 @@ The controller still owns every decision, the pending-approval list (now several
 ## Tests and validation
 
 ```bash
-npm test                  # 146 unit tests (Node test runner; no VS Code, Codex or Ollama needed)
+npm test                  # 154 unit tests (Node test runner; no VS Code, Codex or Ollama needed)
 npm run test:integration  # 31 end-to-end tests in a real Extension Development Host (uses a fake local Ollama / OpenCode)
 npm run test:ollama:explain # REAL local model (opt-in): line-by-line (中文), structured, chunked file; checks line ranges
 npm run test:acceptance   # REAL VS Code host + OpenCode + Ollama in a disposable project: explain file, conflict block, regenerate, edit-before-apply, continue from manual edits, command details/copy/explain
@@ -552,7 +564,7 @@ Real Codex results (codex-cli 0.154.0, Windows 11):
 
 Observed in both approve runs: Codex's final message said it inserted the line "as the first line", but its patch (and our reviewed diff) appended it at the end of the file. The agent's narration was wrong; the recorded diff was right.
 
-Development probe: `node scripts/codex-probe.js` runs one turn in a disposable repo and records the raw protocol trace. It declines all edits; `--approve-commands` accepts commands, which still run read-only.
+Development probe: `node scripts/codex-probe.js` runs one turn in a disposable repo and records the raw protocol trace. It declines all edits; `--approve-commands` accepts commands. Approved commands may run outside the read-only sandbox, so use a disposable repository.
 
 - **Codex unit tests** use an in-memory fake app-server ([src/test/support/fakeCodex.ts](src/test/support/fakeCodex.ts)) with item shapes copied from real traces. They cover: handshake and thread parameters, the boundary check, observed vs intercepted, accept/decline replies, read-only auto-decline of patches, outside-workspace and `.git` patch refusal, permission/question requests, Stop → `turn/interrupt` + `cancel`, steer with `expectedTurnId` and its failure modes, an app-server crash, and running mock tasks after Codex tasks.
 
@@ -637,11 +649,12 @@ Done in v0.5: clickable file references in conversations; Explain Code in Detail
 
 ## Known limitations
 
-- **Command summaries and the WRITES FILES label** are static heuristics from the command text: a script that writes files internally (`python build.py`) is not labelled, and quoted `>` characters can cause a false label. Use **Explain command** for a closer look.
+- **Command summaries, the WRITES FILES label and the shell-write block** are static heuristics from the command text. A script that writes files internally (`python build.py`), a command built at run time, or a PowerShell alias (`sc`, `ac`) is not caught, and `cp` / `mv` / `rm` are labelled but not blocked. False positives are possible too: `npm test > out.txt` or `git diff > x.patch` is blocked, and the agent is told to run it without the redirection. There is no setting to turn the block off. Use **Explain command** for a closer look.
+- **Approved Codex commands** may run outside Codex's read-only sandbox (observed 2026-11-19). The block covers explicit writes only; tests, builds and other programs you approve can still change files without a prior diff.
 - **Review before writing:** *Apply my version* supports one file per proposal; multi-file Codex patches can be accepted or rejected (with feedback) as a whole. Codex is not sent the explanation text when its patch is declined. Conflict checks compare against the snapshot read when the proposal arrived; changes made in the instant between that read and the agent's own read are not detectable.
 - **Manual changes:** baselines exist only for files an agent edited (or you applied) in a recorded conversation, and are dropped when history is cleared. The manual-edit protection is line-based (trimmed): it cannot tell whether a moved or reformatted edit is semantically the same, and it cannot protect edits from commands whose write targets are not visible in the command text.
 - **Live preview** depends on the runtime streaming tool arguments; OpenCode + Ollama did not in real runs, so only the "generating" state is shown.
-- **Codex in read-only sandboxes** may decline to propose a patch at all ("the workspace is read-only") unless told that patches are reviewed. Observed with `gpt-6.2-sol`.
+- **Codex in read-only sandboxes** may decline to propose a patch at all ("the workspace is read-only") unless told that patches are reviewed. Observed with `gpt-6.2-sol`. Profiles that can apply patches now say so in `developerInstructions`; this has fixture coverage, not a real Codex run.
 - **Demo fixture:** `demo-workspace/` is also the first folder of the F5 development workspace. Real agent sessions run there can modify it, which breaks fixture-based tests. Use a separate project for real agent sessions.
 - **References:** relative paths with spaces are recognised in Markdown links and code spans, not in plain prose (where they can't be told apart from a sentence); absolute paths with spaces in prose are recognised when the file name itself has no space. Python traceback lines (`File "x.py", line 12`) and references inside fenced code blocks are not linked. References are linked in the Conversations panel and explanation panel, not in the Agent Activity sidebar.
 - **Explain Code in Detail:** output is model-generated and unverified; [Fact]/[Inference]/[Issue] labels are the model's own. Small models may produce malformed headings (cleaned where possible), overlapping ranges, or skip lines (reported as *Not covered*). Chunking is syntax-aware for Python and TS/JS; other languages are split by lines with blank-line boundaries. Explanations are kept for the current window session only (export to keep them).

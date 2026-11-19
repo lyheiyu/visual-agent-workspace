@@ -159,7 +159,7 @@ export interface OperationSink {
    * intercepted (enforcement: agent-approval) and resolves with the user's
    * decision, or 'cancelled' if the task is stopped.
    */
-  requestDecision(operationId: string, reason?: string): Promise<{ decision: OperationDecision; reason?: string }>;
+  requestDecision(operationId: string, reason?: string): Promise<{ decision: OperationDecision; reason?: string; blocked?: boolean }>;
   /** Record an automatic (policy) decision without asking the user. */
   autoDecide(operationId: string, decision: 'rejected', reason: string): void;
   log(message: string): void;

@@ -136,6 +136,10 @@ const cases: Case[] = [
       await new Promise((r) => setTimeout(r, 300));
       assert.equal(vscode.window.visibleTextEditors.length, 0, 'no editors opened');
       assert.ok(!diffTabOpen(), 'no diff opened automatically');
+      const pendingId = controller.getSnapshot().awaitingApprovalFor!;
+      await vscode.commands.executeCommand('visualAgent.approve');
+      assert.ok(diffTabOpen(), 'approval first opens the diff even with follow disabled');
+      assert.equal(controller.getSnapshot().awaitingApprovalFor, pendingId, 'opening the diff does not approve or write');
       await vscode.commands.executeCommand('visualAgent.stop');
       await controller.whenIdle();
       assert.equal(recorder.getTask(taskId)!.status, 'Stopped');
@@ -1275,14 +1279,15 @@ const v07Cases: Case[] = [
         assert.equal(replies.w2, undefined, 'the agent was NOT given approval');
         assert.equal(fs.readFileSync(conv.file, 'utf8'), USER, 'manual edit intact');
         assert.equal(await controls.proposals.regenerate(w2, 'keep my comment'), true);
-        // A command that writes the manually edited file: blocked too (heuristic write target).
-        const b3 = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== w2 ? id : undefined; }, 'command');
-        const c3 = await controls.proposals.check(b3);
-        assert.equal(c3.files[0]?.reason, 'command-writes-edited');
-        await vscode.commands.executeCommand('visualAgent.approve');
-        await new Promise((r) => setTimeout(r, 300));
-        assert.equal(replies.b3, undefined, 'command not approved');
-        controller.reject(b3, 'blocked');
+        // A shell command that writes the manually edited file: an explicit shell write,
+        // so it is blocked before the user is even asked, and the agent is told to use a patch.
+        await waitUntil(() => replies.b3, 'command blocked');
+        assert.equal(replies.b3, 'reject', 'command never approved');
+        const b3 = recorder.getOperations(conv.id).find((o) => o.externalId === 'b3')!;
+        assert.equal(b3.status, 'Rejected');
+        assert.equal(b3.command?.status, 'NotRun');
+        assert.match(b3.history.at(-1)!.note!, /Blocked before execution[\s\S]*redirection > → math\.js/);
+        assert.ok(!b3.history.some((h) => h.actor === 'user'), 'no approval prompt for a shell write');
         await waitUntil(() => controller.getSnapshot().awaitingInput, 'turn done');
         assert.equal(fs.readFileSync(conv.file, 'utf8'), USER);
       } finally {

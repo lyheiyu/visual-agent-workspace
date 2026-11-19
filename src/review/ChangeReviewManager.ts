@@ -25,6 +25,11 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
   static readonly scheme = 'visual-agent-change';
 
   private readonly prepared = new Map<string, Promise<PreparedChange>>();
+  private readonly displayed = new Set<string>();
+
+  hasDisplayed(changeId: string): boolean {
+    return this.displayed.has(changeId);
+  }
   private readonly emitter = new vscode.EventEmitter<vscode.Uri>();
   readonly onDidChange = this.emitter.event;
   private readonly registration: vscode.Disposable;
@@ -38,6 +43,7 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
 
   /** Snapshot the target file and compute the proposed full-file text. */
   prepare(change: ProposedChangeContent): void {
+    this.displayed.delete(change.changeId);
     this.prepared.set(change.changeId, this.compute(change));
   }
 
@@ -70,10 +76,11 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
       ? `${target}: Current ↔ Codex patch`
       : `${target}: Original ↔ Proposed (not applied)`;
     await vscode.commands.executeCommand('vscode.diff', this.uriFor(changeId, 'original', base), this.uriFor(changeId, 'proposed', base), title, {
-      preview: true,
+      preview: false,
       preserveFocus: options.preserveFocus,
       viewColumn: options.viewColumn,
     } satisfies vscode.TextDocumentShowOptions);
+    this.displayed.add(changeId);
     if (p.note) {
       void vscode.window.showWarningMessage(p.note);
     }
@@ -103,6 +110,7 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
 
     clear(): void {
     this.prepared.clear();
+    this.displayed.clear();
   }
 
   dispose(): void {

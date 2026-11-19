@@ -9,6 +9,7 @@ import { CodexRpcClient } from '../adapters/codex/CodexRpcClient';
 import { CodexProfileId, getProfile } from '../adapters/codex/profiles';
 import { ProposedChangeContent } from '../types/events';
 import { commandItem, FakeCodexServer, fileChangeItem } from './support/fakeCodex';
+import { CODEX_ADD_CONTENT_CASE } from './support/shellFixtures';
 
 const ROOT = path.resolve(__dirname, '..', '..', 'demo-workspace');
 
@@ -319,4 +320,73 @@ test('declined Codex proposal after the turn ended: recorded as NOT delivered (n
   assert.ok(op, 'delivery attempt is visible');
   assert.equal(op!.status === 'Failed' || op!.status === 'Cancelled', true, op!.status);
   if (op!.status === 'Failed') assert.match(op!.resultSummary!, /NOT delivered/);
+});
+
+test('shell source writes: the Add-Content case is blocked before the user is asked; patches and test/build commands still go to the user', async () => {
+  const replies: Array<{ step: string; result: unknown }> = [];
+  const { server, recorder, controller, adapter, changes } = setup('approve-edits', async (s) => {
+    // 1. The supplied case: an explicit shell write of style.css.
+    s.itemStarted(commandItem(ROOT, { id: 'exec-w', command: CODEX_ADD_CONTENT_CASE, commandActions: [{ type: 'unknown', command: CODEX_ADD_CONTENT_CASE }] }));
+    replies.push({ step: 'write', result: (await s.request('item/commandExecution/requestApproval', { threadId: s.threadId, turnId: s.turnId, itemId: 'exec-w', reason: '是否允许写入 style.css？' })).result });
+    await tick(40); // the turn is still active while the block reason is delivered
+    s.itemCompleted(commandItem(ROOT, { id: 'exec-w', status: 'declined', command: CODEX_ADD_CONTENT_CASE, commandActions: [] }));
+    // 2. Normal patch: still reviewed and approved by the user.
+    s.itemStarted(fileChangeItem(path.join(ROOT, 'validation.py'), { id: 'p-ok' }));
+    replies.push({ step: 'patch', result: (await s.request('item/fileChange/requestApproval', { threadId: s.threadId, turnId: s.turnId, itemId: 'p-ok' })).result });
+    s.itemCompleted(fileChangeItem(path.join(ROOT, 'validation.py'), { id: 'p-ok', status: 'completed' }));
+    // 3. Tests and builds: command approval, with the "may generate files" note.
+    for (const [id, command] of [['exec-t', 'npm test'], ['exec-b', 'npm run build']]) {
+      s.itemStarted(commandItem(ROOT, { id, command, commandActions: [{ type: 'unknown', command }] }));
+      replies.push({ step: id, result: (await s.request('item/commandExecution/requestApproval', { threadId: s.threadId, turnId: s.turnId, itemId: id })).result });
+      s.itemCompleted(commandItem(ROOT, { id, command, status: 'completed', exitCode: 0, aggregatedOutput: 'ok', commandActions: [] }));
+    }
+    s.completeTurn('completed');
+  });
+  const taskId = controller.start('Match the dashboard palette', adapter);
+
+  // The first thing the user is asked about is the patch: the shell write never reached them.
+  let snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
+  const patch = recorder.getOperation(snap.awaitingApprovalFor!)!;
+  assert.equal(patch.operationType, 'Edit');
+  assert.equal(changes.length, 1, 'the patch diff is available before approval');
+  assert.match(changes[0].unifiedDiff ?? '', /\+# reviewed/);
+  assert.ok(controller.approve(patch.operationId));
+
+  for (const command of ['npm test', 'npm run build']) {
+    snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor && recorder.getOperation(x.awaitingApprovalFor)!.command?.command === command);
+    const op = recorder.getOperation(snap.awaitingApprovalFor!)!;
+    assert.match(op.history.map((h) => h.note).join(' '), /may create or change files[\s\S]*No diff is available before it runs/, command);
+    assert.ok(controller.approve(op.operationId));
+  }
+  await controller.whenIdle();
+
+  assert.deepEqual(replies, [
+    { step: 'write', result: { decision: 'decline' } },
+    { step: 'patch', result: { decision: 'accept' } },
+    { step: 'exec-t', result: { decision: 'accept' } },
+    { step: 'exec-b', result: { decision: 'accept' } },
+  ]);
+  const ops = recorder.getOperations(taskId);
+  const blocked = ops.find((o) => o.externalId === 'exec-w')!;
+  assert.equal(blocked.status, 'Rejected');
+  assert.equal(blocked.command?.status, 'NotRun', 'never executed');
+  assert.ok(!blocked.history.some((h) => h.actor === 'user'), 'decided without asking the user');
+  assert.match(blocked.history.at(-1)!.note!, /Blocked before execution: the command writes files through the shell \(Add-Content → web\/style\.css\)/);
+  const steer = server.received.find((m) => m.method === 'turn/steer')!;
+  assert.ok(steer, 'the agent is told why, in the same turn');
+  assert.equal(steer.params.expectedTurnId, 'turn-1');
+  assert.match(steer.params.input[0].text, /^Blocked before execution by Visual Agent Workspace[\s\S]*Resubmit the change with your file edit \/ patch tool/);
+  assert.doesNotMatch(steer.params.input[0].text, /The user declined/);
+  const delivered = ops.find((o) => o.operationType === 'Instruct')!;
+  assert.match(delivered.description, /Send block reason to Codex/);
+  assert.match(delivered.resultSummary!, /Delivered/);
+  // Agents are told up front to use the patch tool.
+  assert.match(server.received.find((m) => m.method === 'thread/start')!.params.developerInstructions, /file edit \/ patch tool[\s\S]*blocked before they run/);
+});
+
+test('read-only Codex profiles get no edit instructions (they decline edits anyway)', async () => {
+  const { server, controller, adapter } = setup('observe', async (s) => s.completeTurn('completed'));
+  controller.start('x', adapter);
+  await controller.whenIdle();
+  assert.equal(server.received.find((m) => m.method === 'thread/start')!.params.developerInstructions, undefined);
 });

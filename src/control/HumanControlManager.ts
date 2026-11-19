@@ -427,9 +427,24 @@ export class HumanControlManager implements vscode.Disposable {
 
   private async approve(operationId?: string): Promise<void> {
     const id = operationId ?? this.controller.getSnapshot().awaitingApprovalFor;
-    // Never let an approval overwrite changes made after the diff was shown.
     if (id && this.controller.getSnapshot().pendingApprovals.includes(id) && !(await this.proposals.guardApproval(id))) {
       return;
+    }
+    const op = id ? this.recorder.getOperation(id) : undefined;
+    if (op?.operationType === 'Edit' && this.controller.getSnapshot().pendingApprovals.includes(op.operationId)) {
+      const ids = [...new Set([...(op.associatedChangeIds ?? []), ...(op.associatedChangeId ? [op.associatedChangeId] : [])])];
+      if (!ids.length) {
+        void vscode.window.showWarningMessage('Cannot approve: no reviewable diff is available. Reject and request a file patch. / 无法批准：没有可审查的差异，请拒绝并要求提交文件补丁。');
+        return;
+      }
+      const unseen = ids.filter((changeId) => !this.review.hasDisplayed(changeId));
+      if (unseen.length) {
+        for (const changeId of unseen) {
+          if (!(await this.review.showDiff(changeId, { preserveFocus: false }))) return;
+        }
+        void vscode.window.showInformationMessage('Review the proposed changes, then approve again to apply. Nothing has been written. / 请先查看差异，再次批准才会写入。');
+        return;
+      }
     }
     if (!id || !this.controller.approve(id)) {
       void vscode.window.showWarningMessage(localizeError('That operation is not awaiting approval.', this.language()));
@@ -679,7 +694,7 @@ export class HumanControlManager implements vscode.Disposable {
       ? ' [SIMULATED: nothing will be written to disk]'
       : op.operationType === 'Edit'
         ? ' [REAL: approving lets Codex apply this ENTIRE patch]'
-        : ' [REAL: Codex is waiting; approved commands still run in its read-only sandbox]';
+        : ' [REAL: Codex is waiting; an approved command may run outside its read-only sandbox and change files]';
     for (;;) {
       const options = op.associatedChangeId ? ['Review Diff', 'Approve', 'Reject'] : ['Approve', 'Reject'];
       const choice = await vscode.window.showInformationMessage(

@@ -3,12 +3,15 @@ import { AskForApproval, SandboxMode } from './protocol';
 export type CodexProfileId = 'observe' | 'approve-commands' | 'approve-edits';
 
 /**
- * Safety profiles. Every profile uses Codex's READ-ONLY sandbox: shell
- * commands can never write to the workspace (verified on Windows: an approved
- * `Set-Content` failed with "Access to the path ... is denied").
+ * Safety profiles. Every profile uses Codex's READ-ONLY sandbox for commands
+ * Codex runs without asking. A command Codex asks to run, once APPROVED, may
+ * run outside that sandbox and write files: observed 2026-11-19 on Windows,
+ * where an approved `Add-Content` wrote style.css (an earlier Codex build
+ * failed the same kind of write with "Access to the path ... is denied").
  *
- * The only way a file can change is a Codex patch (`fileChange`) that the
- * user explicitly approves, and only in 'approve-edits'.
+ * Reviewable file changes are Codex patches (`fileChange`), shown as a diff
+ * and applied only after approval, only in 'approve-edits'. Commands that
+ * explicitly write files are blocked before the user is asked (controller).
  */
 export interface CodexProfile {
   id: CodexProfileId;
@@ -44,8 +47,8 @@ export const CODEX_PROFILES: Record<CodexProfileId, CodexProfile> = {
     commandApprovals: 'ask-user',
     fileChanges: 'auto-decline',
     boundary:
-      'Codex read-only sandbox + approval policy "untrusted": Codex must ask before running commands (approved commands still run read-only). Edits are declined automatically.',
-    detail: 'Codex must ask before each non-trusted command. Approved commands still cannot write. Edits are declined.',
+      'Codex read-only sandbox + approval policy "untrusted": Codex must ask before running commands. An approved command may run outside the sandbox; commands that explicitly write files are blocked. Edits are declined automatically.',
+    detail: 'Codex must ask before each non-trusted command. Commands that explicitly write files are blocked; an approved command may still change files indirectly. Edits are declined.',
   },
   'approve-edits': {
     id: 'approve-edits',
@@ -55,9 +58,9 @@ export const CODEX_PROFILES: Record<CodexProfileId, CodexProfile> = {
     commandApprovals: 'ask-user',
     fileChanges: 'ask-user',
     boundary:
-      'Codex read-only sandbox + "untrusted": commands need approval and cannot write; a patch is applied only after you approve that whole patch (paths must be inside the workspace).',
+      'Codex read-only sandbox + "untrusted": commands need approval, and commands that explicitly write files are blocked; a patch is applied only after you approve that whole patch (paths must be inside the workspace).',
     detail:
-      'Codex must ask before each command and each patch. You review the full diff; approving applies that entire patch. Commands still cannot write.',
+      'Codex must ask before each command and each patch. You review the full diff; approving applies that entire patch. Commands that explicitly write files are blocked; tests and builds may still generate files.',
   },
 };
 

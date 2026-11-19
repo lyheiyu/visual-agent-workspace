@@ -13,6 +13,7 @@ import { NormalizedEventApplier } from '../normalizedEvents';
 import { CodexLocation, codexEnvironment } from './codexLocator';
 import { CodexProfile } from './profiles';
 import { ISOLATION_ARGS } from './CodexSession';
+import { SOURCE_EDIT_POLICY } from '../../agents/editPolicy';
 import {
   ApprovalDecision,
   CommandApprovalParams,
@@ -124,6 +125,8 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
         sandbox: profile.sandbox,
         ephemeral: true,
         serviceName: 'visual-agent-workspace',
+        // Only profiles that can apply patches get the edit rule; read-only ones decline edits anyway.
+        ...(profile.fileChanges === 'ask-user' ? { developerInstructions: SOURCE_EDIT_POLICY } : {}),
       });
       this.threadId = started.thread.id;
       // No silent substitution: an explicitly selected model must be the one Codex runs.
@@ -233,10 +236,11 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
    * sent right after the decline as a steer of the same turn. The outcome is
    * recorded: if the turn already ended, the timeline says it was NOT delivered.
    */
-  private deliverReason(sink: OperationSink, what: 'command' | 'file change', subject: string, reason: string): void {
-    const text = `The user declined your proposed ${what}${subject ? ` (${subject.slice(0, 300)})` : ''}. Their reason / feedback: ${reason.slice(0, 2500)}`;
+  private deliverReason(sink: OperationSink, what: 'command' | 'file change', subject: string, reason: string, blocked = false): void {
+    // A policy block is already addressed to the agent; a user decision is relayed as such.
+    const text = blocked ? reason.slice(0, 2800) : `The user declined your proposed ${what}${subject ? ` (${subject.slice(0, 300)})` : ''}. Their reason / feedback: ${reason.slice(0, 2500)}`;
     setTimeout(() => {
-      const op = sink.announce({ operationType: 'Instruct', description: `Send decline reason to Codex: ${reason.slice(0, 100)}`, rationale: text });
+      const op = sink.announce({ operationType: 'Instruct', description: blocked ? 'Send block reason to Codex: resubmit as an editable patch' : `Send decline reason to Codex: ${reason.slice(0, 100)}`, rationale: text });
       this.steer(text).then(
         () => sink.complete(op, { outcome: 'Completed', resultSummary: 'Delivered to the active Codex turn (turn/steer).' }),
         (err) => sink.complete(op, { outcome: 'Failed', resultSummary: `NOT delivered: ${(err as Error).message}. Codex only received "decline".` }),
@@ -332,11 +336,12 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
           sink.autoDecide(opId, 'rejected', `the "${profile.label}" profile never grants command approvals`);
           return { decision: 'decline' satisfies ApprovalDecision };
         }
-        const { decision, reason } = await sink.requestDecision(opId, p.reason ?? undefined);
+        const { decision, reason, blocked } = await sink.requestDecision(opId, p.reason ?? undefined);
         if (decision === 'approved') {
-          sink.markRunning(opId, 'Approved by user; Codex runs it inside the read-only sandbox');
+          // Observed 2026-11: an approved command can run outside the read-only sandbox and write files.
+          sink.markRunning(opId, 'Approved by user; Codex runs it (an approved command may run outside the read-only sandbox)');
         } else if (decision === 'rejected' && reason) {
-          this.deliverReason(sink, 'command', p.command ?? '', reason);
+          this.deliverReason(sink, 'command', p.command ?? '', reason, blocked);
         }
         return { decision: toCodexDecision(decision) };
       }

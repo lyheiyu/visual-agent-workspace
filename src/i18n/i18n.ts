@@ -145,7 +145,7 @@ export const STRINGS = {
   'ctl.explain.instruct': ['Your instruction to the running agent. Instructions cannot change the sandbox or approval policy.', '你发给运行中代理的指令。指令无法更改沙箱或审批策略。'],
   'ctl.explain.observed': ['Observed only: the agent reported this operation without asking. Visual Agent could not block it; it was constrained only by the agent sandbox (Codex read-only).', '仅观察：代理未经询问就报告了此操作。Visual Agent 无法阻止它，只受代理沙箱（Codex 只读）约束。'],
   'ctl.explain.interceptedEdit': ['Intercepted: Codex waited for a decision before applying this patch. A decision covers the ENTIRE patch, not individual functions.', '已拦截：Codex 在应用此补丁前等待了决定。决定针对整个补丁，而非单个函数。'],
-  'ctl.explain.intercepted': ['Intercepted: the agent waited for a decision before running this. Approved commands still run inside the read-only sandbox.', '已拦截：代理在执行前等待了决定。已批准的命令仍在只读沙箱中运行。'],
+  'ctl.explain.intercepted': ['Intercepted: the agent waited for a decision before running this. An approved command may change files (tests and builds can generate files); commands that explicitly write files are blocked.', '已拦截：代理在执行前等待了决定。已批准的命令仍可能改动文件（测试和构建可能生成文件）；明确写文件的命令会被拦截。'],
   'ctl.explain.simulated': ['Simulated: dispatched by the Visual Agent controller; nothing real was executed.', '模拟：由 Visual Agent 控制器分派；没有真实执行任何操作。'],
   'ctl.explain.controller': ['Dispatched by the Visual Agent controller.', '由 Visual Agent 控制器分派。'],
 
@@ -280,6 +280,8 @@ export const STRINGS = {
   'x.pickFunction': ['Explain which function or class? (its role within the project)', '解释哪个函数或类？（说明它在项目中的作用）'],
   'c.writes': ['WRITES FILES (detected)', '会写文件（已检测）'],
   'c.writesDetail': ['Detected from the command text (heuristic): may create, modify or delete files — {reasons}', '根据命令文本检测（启发式）：可能创建、修改或删除文件——{reasons}'],
+  'c.mayGenerate': ['Tests, builds and installs may create or change files (build output, caches, snapshots, reports). No diff is available before it runs.', '测试、构建和安装可能创建或修改文件（构建产物、缓存、快照、报告）。运行前无法提供 diff。'],
+  'c.blockedWrite': ['Blocked before execution: this command writes files through the shell, so no diff could be reviewed. The agent was asked to resubmit it as an editable patch.', '已在执行前拦截：该命令通过 shell 写文件，无法先审查 diff。已要求代理改用可编辑的补丁重新提交。'],
   'c.noWriteDetected': ['No file write detected. This is a heuristic from the command text only: the command, or a script or program it runs, may still create, modify or delete files.', '未检测到写文件。这只是根据命令文本的启发式判断：该命令或它运行的脚本/程序仍可能创建、修改或删除文件。'],
   'c.heuristicTip': ['Detected from the command text only (heuristic)', '仅根据命令文本判断（启发式）'],
   'c.fullCommand': ['Full command', '完整命令'],

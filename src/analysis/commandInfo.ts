@@ -8,6 +8,8 @@
  * package installs, git state changes, PowerShell writers, inline scripts
  * that open files for writing). It never claims a command is safe.
  */
+import { detectShellWrites } from './shellWrites';
+
 export interface CommandInfo {
   /** Short purpose, e.g. "Run tests (pytest)", "Install packages (npm)". */
   summary: string;
@@ -24,6 +26,10 @@ export interface CommandInfo {
   long: boolean;
   /** First line, truncated (for one-line display). */
   short: string;
+  /** Explicit shell write of file content (see detectShellWrites): blocked before execution. */
+  sourceWrite: boolean;
+  /** Tests, builds and installs may generate or change files; there is no diff before they run. */
+  mayGenerate: boolean;
 }
 
 const LONG = 160;
@@ -178,6 +184,12 @@ export function describeCommand(command: string): CommandInfo {
     summaries.push({ label: `Run ${prog}`, kind: 'run' });
   }
   if (heredoc && writeTargets.length) writeReasons.push('here-document written to a file');
+  // Explicit content writes, including those inside powershell -Command / bash -c wrappers.
+  const explicit = detectShellWrites(text);
+  for (const w of explicit.writes) {
+    if (w.target) writeTargets.push(w.target);
+    writeReasons.push(w.target ? `${w.via} writes ${w.target}` : `${w.via} writes files`);
+  }
   const first = summaries.find((s) => s.kind !== 'read') ?? summaries[0];
   const kind: CommandInfo['kind'] = first?.kind ?? 'run';
   const label = first?.label ?? 'Run command';
@@ -192,6 +204,8 @@ export function describeCommand(command: string): CommandInfo {
     embeddedCode: heredoc || inlineScript || /\r?\n/.test(text),
     long: text.length > LONG || /\r?\n/.test(text),
     short: firstLine.length > 90 ? firstLine.slice(0, 89) + '…' : firstLine,
+    sourceWrite: explicit.blocked,
+    mayGenerate: summaries.some((x) => x.kind === 'test' || x.kind === 'build' || x.kind === 'install'),
   };
 }
 

@@ -103,7 +103,7 @@ export interface OperationRow {
   /** Failed steps: a short reason from the recorded result/output (no model). */
   errorReason?: string;
   hasChange: boolean;
-  cmd?: { summary: string; writes: boolean; writeTargets: string[]; writeReasons: string[]; long: boolean; embeddedCode: boolean; short: string; duration?: string; exitCode?: number };
+  cmd?: { summary: string; writes: boolean; writeTargets: string[]; writeReasons: string[]; long: boolean; embeddedCode: boolean; short: string; duration?: string; exitCode?: number; sourceWrite: boolean; mayGenerate: boolean };
 }
 
 export interface OperationDetail extends OperationRow {
@@ -199,6 +199,8 @@ function commandRow(op: AgentOperation): OperationRow['cmd'] {
     long: info.long,
     embeddedCode: info.embeddedCode,
     short: info.short,
+    sourceWrite: info.sourceWrite,
+    mayGenerate: info.mayGenerate,
     duration: formatDuration(ms),
     exitCode: op.command!.exitCode ?? op.exitCode,
   };

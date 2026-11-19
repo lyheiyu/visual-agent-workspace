@@ -17,6 +17,8 @@ import { EventRecorder } from '../recorder/EventRecorder';
 import { buildTaskSummary } from '../recorder/summary';
 import { AgentOperation, ProposedChangeContent, TaskStatus, TERMINAL_STATUSES } from '../types/events';
 import { Emitter } from '../util/emitter';
+import { describeCommand } from '../analysis/commandInfo';
+import { describeShellWrites, detectShellWrites, shellWriteBlockMessage } from '../analysis/shellWrites';
 
 /** Decides whether an operation must be approved by the user before it runs. */
 export type ApprovalPolicy = (request: OperationRequest) => boolean;
@@ -641,6 +643,26 @@ export class AgentController {
           { actor: 'agent' },
         );
         this.recorder.addNote(id, 'agent', `Agent is waiting for approval${reason ? `: ${reason}` : ''}`);
+        // Shell commands that explicitly write file content never reach the user:
+        // they cannot show a diff before running. The agent is told to resubmit
+        // the change as an editable patch. Heuristic, from the command text only.
+        const pending = this.recorder.getOperation(id)!;
+        if (pending.command?.command) {
+          const found = detectShellWrites(pending.command.command);
+          if (found.blocked) {
+            this.recordChangeDecision(pending, 'rejected', 'shell file write');
+            this.recorder.updateOperation(
+              id,
+              { status: 'Rejected', command: { status: 'NotRun' } },
+              { actor: 'controller', note: `Blocked before execution: the command writes files through the shell (${describeShellWrites(found)}). The agent was asked to resubmit the change as an editable patch.` },
+            );
+            this.emitState();
+            return { decision: 'rejected' as const, reason: shellWriteBlockMessage(found), blocked: true };
+          }
+          if (describeCommand(pending.command.command).mayGenerate) {
+            this.recorder.addNote(id, 'controller', 'Tests, builds and installs may create or change files (build output, caches, snapshots, reports). No diff is available before it runs; check the files afterwards.');
+          }
+        }
         const result = await this.awaitDecision(id);
         const op = this.recorder.getOperation(id)!;
         this.recordChangeDecision(op, result.decision, result.reason);
