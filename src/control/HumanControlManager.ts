@@ -860,7 +860,7 @@ export class HumanControlManager implements vscode.Disposable {
     if (doc.languageId !== languageId) {
       doc = await vscode.languages.setTextDocumentLanguage(doc, languageId);
     }
-    await vscode.window.showTextDocument(doc, { preview: true });
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside, preserveFocus: true });
   }
 
   private feedback(ok: boolean, otherwise: string): void {
