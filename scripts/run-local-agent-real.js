@@ -18,7 +18,7 @@ const { createDisposableJsRepo } = require('./lib/disposable-js-repo');
 
 const root = path.resolve(__dirname, '..');
 const models = (process.env.VAW_LOCAL_MODELS || 'qwen3:8b').split(',').map((s) => s.trim());
-const scenarios = (process.env.VAW_SCENARIOS || 'analysis,edit,cancel').split(',');
+const scenarios = (process.env.VAW_SCENARIOS || 'analysis,edit,recovery,cancel').split(',');
 const home = path.join(os.tmpdir(), 'vaw-opencode-home'); // reused: keeps OpenCode's provider package cache
 const results = [];
 const check = (name, ok, detail = '') => {
@@ -29,7 +29,7 @@ const check = (name, ok, detail = '') => {
 function waitFor(c, pred, ms = 600000) {
   return new Promise((resolve, reject) => {
     if (pred(c.getSnapshot())) return resolve(c.getSnapshot());
-    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    const t = setTimeout(() => { sub.dispose(); reject(new Error('timeout')); }, ms);
     const sub = c.onDidChangeState((s) => {
       if (pred(s)) {
         clearTimeout(t);
@@ -67,6 +67,12 @@ async function analysis(model) {
   check(`[${model}] read-only analysis read math.js`, firstOps.some((o) => o.operationType === 'Read' && o.filePath === 'math.js'), `${((t1 - t0) / 1000).toFixed(1)} s`);
   check(`[${model}] analysis produced an answer`, firstOps.some((o) => /^Local agent: /.test(o.description)));
   if (controller.getSnapshot().taskStatus === 'Running') {
+    const session = recorder.getTask(taskId).session?.id;
+    const oversized = { name: 'large.txt', mime: 'text/plain', data: Buffer.from('context '.repeat(12000)).toString('base64') };
+    let refused = false;
+    try { await controller.steer('Consider this attachment.', [oversized]); }
+    catch (error) { refused = /context budget/.test(error.message); }
+    check(`[${model}] oversized input rejected without ending the session`, refused && controller.getSnapshot().awaitingInput && recorder.getTask(taskId).session?.id === session);
     await controller.steer('Which function would fail on a zero argument? Answer in one sentence.');
     await waitFor(controller, (s) => s.awaitingInput || s.taskStatus !== 'Running');
     const answers = recorder.getOperations(taskId).filter((o) => /^Local agent: /.test(o.description));
@@ -149,6 +155,76 @@ async function edit(model) {
   await repo.dispose();
 }
 
+async function recovery(model) {
+  const repo = createDisposableJsRepo();
+  const { recorder, controller, adapter } = setup(repo, model, 'approved-write');
+  const taskId = controller.start(
+    'First run node test.js to reproduce the failing test. Then fix divide in math.js so zero throws Error("division by zero"). ' +
+    'Read math.js before editing it. Then read README.md and use its actual text to document that behavior with the edit tool. ' +
+    'Confirm both edit calls succeeded, then run node test.js again and verify it passes.',
+    adapter, repo.dir,
+  );
+  try {
+    const deadline = Date.now() + 240000;
+    for (;;) {
+      const state = await waitFor(controller, (s) => !!s.awaitingApprovalFor || s.awaitingInput || s.taskStatus !== 'Running', deadline - Date.now());
+      if (!state.awaitingApprovalFor) break;
+      const op = recorder.getOperation(state.awaitingApprovalFor);
+      const allowed = op.operationType === 'Edit'
+        ? ['math.js', 'README.md'].includes(op.filePath) && !!op.associatedChangeId
+        : /^node\s+test\.js$/i.test(op.command?.command.trim() ?? '');
+      if (allowed) controller.approve(op.operationId);
+      else controller.reject(op.operationId, 'Only math.js, README.md and node test.js are in scope.');
+    }
+    const ops = recorder.getOperations(taskId);
+    const failed = ops.findIndex((o) => o.command?.exitCode > 0);
+    const fixed = ops.findIndex((o, i) => i > failed && o.operationType === 'Edit' && o.filePath === 'math.js' && o.status === 'Completed');
+    check(`[${model}] failed test → edit → passing test`, failed >= 0 && fixed > failed && ops.slice(fixed + 1).some((o) => o.command?.exitCode === 0));
+    check(`[${model}] real edits in both files`, /math\.js/.test(repo.status()) && /README\.md/.test(repo.status()) && spawnSync(process.execPath, ['test.js'], { cwd: repo.dir }).status === 0);
+    summarize(recorder, taskId);
+  } finally {
+    if (controller.isActive) controller.stop();
+    await controller.whenIdle();
+    await repo.dispose();
+  }
+}
+
+async function compaction(model) {
+  const repo = createDisposableJsRepo();
+  fs.writeFileSync(path.join(repo.dir, 'reference.txt'), Array.from({ length: 1800 }, (_, i) => 'Reference line ' + i + ': preserve the original divide requirement and pending documentation.').join('\n'));
+  const { recorder, controller } = setup(repo, model, 'read-only');
+  const events = [];
+  const adapter = new OpenCodeAdapter({
+    connector: async (launch) => {
+      const connection = await startOpenCodeServer(launch);
+      return {
+        ...connection,
+        subscribe: (listener, signal) => connection.subscribe((event) => {
+          if (/compact/i.test(event.type) || event.properties?.info?.summary) events.push(event.type);
+          listener(event);
+        }, signal),
+      };
+    },
+    launch: { executable: locateOpenCode(undefined, root), homeDir: home, ollamaBaseUrl: 'http://127.0.0.1:11434', model, contextLimit: 8192, outputLimit: 2048, profile: 'read-only' },
+  });
+  const id = controller.start('Remember requirement marker KEEP-DIVIDE-719 and pending task to document divide. Read reference.txt with the read tool, then explain math.js briefly. Do not edit files.', adapter, repo.dir);
+  try {
+    await waitFor(controller, (s) => s.awaitingInput || s.taskStatus !== 'Running', 120000);
+    check(`[${model}] automatic compaction observed`, events.length > 0, events.join(', '));
+    if (controller.getSnapshot().awaitingInput) {
+      await controller.steer('What exact requirement marker and pending task did I give you?');
+      await waitFor(controller, (s) => s.awaitingInput || s.taskStatus !== 'Running', 90000);
+      const answer = recorder.getOperations(id).filter((op) => /^Local agent:/.test(op.description)).at(-1)?.resultSummary ?? '';
+      check(`[${model}] requirements survive long-context continuation`, answer.includes('KEEP-DIVIDE-719') && /document/i.test(answer), answer.slice(0, 180));
+    }
+    summarize(recorder, id);
+  } finally {
+    if (controller.isActive) controller.stop();
+    await controller.whenIdle();
+    await repo.dispose();
+  }
+}
+
 async function cancel(model) {
   const repo = createDisposableJsRepo();
   const { recorder, controller, adapter } = setup(repo, model, 'read-only');
@@ -180,6 +256,8 @@ async function cancel(model) {
       try {
         if (s === 'analysis') await analysis(model);
         if (s === 'edit') await edit(model);
+        if (s === 'recovery') await recovery(model);
+        if (s === 'compaction') await compaction(model);
         if (s === 'cancel') await cancel(model);
       } catch (err) {
         check(`[${model}] ${s}`, false, err.message);

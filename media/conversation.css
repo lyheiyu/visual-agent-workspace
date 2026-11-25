@@ -55,6 +55,18 @@ textarea:focus { outline: 1px solid var(--vscode-focusBorder); }
 
 .approval.conflict { border-color: var(--vscode-errorForeground); }
 .approval.preview { border-style: dashed; }
+.edit-files { list-style: none; margin: 6px 0 10px; padding: 0; }
+.edit-file { padding: 3px 6px; border-left: 2px solid transparent; overflow-wrap: anywhere; }
+.edit-file.active { border-left-color: var(--vscode-focusBorder); background: var(--vscode-list-inactiveSelectionBackground); }
+.edit-file .file-link { background: none; border: none; padding: 0; margin-right: 0; color: var(--vscode-textLink-foreground); cursor: pointer; text-decoration: underline; font: inherit; }
+.edit-file.edited .file-link { font-weight: 600; }
+.edit-file.delete .file-link { text-decoration: line-through; }
 .preview-text { max-height: 260px; overflow: auto; white-space: pre-wrap; background: var(--vscode-textCodeBlock-background); padding: 8px; }
 .pill.writes { display: inline-block; font-size: .8em; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--vscode-editorWarning-foreground); color: var(--vscode-editorWarning-foreground); }
 .approval details pre { max-height: 240px; overflow: auto; }
+
+.attachment-tray { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0; }
+.attachment { display:flex; align-items:center; gap:6px; padding:6px; border:1px solid var(--vscode-panel-border); border-radius:5px; max-width:100%; overflow-wrap:anywhere; }
+.attachment img { width:64px; height:64px; object-fit:contain; }
+/* Long task descriptions: two lines in the header, full text on hover. */
+.clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

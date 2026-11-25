@@ -90,6 +90,7 @@ export interface OllamaModelInfo {
 export async function discoverOllamaCodingModels(endpoint: string, fetchImpl: typeof fetch = fetch): Promise<ModelOption[]> {
   const base = endpoint.replace(/\/+$/, '');
   const tags = (await (await fetchImpl(`${base}/api/tags`, { signal: AbortSignal.timeout(5000) })).json()) as { models?: Array<any> };
+  const loaded = await loadedOllamaModels(base, fetchImpl).catch(() => []);
   const out: ModelOption[] = [];
   for (const m of tags.models ?? []) {
     let caps: string[] | undefined;
@@ -99,7 +100,11 @@ export async function discoverOllamaCodingModels(endpoint: string, fetchImpl: ty
       caps = Array.isArray(show.capabilities) ? show.capabilities : undefined;
       const mi = show.model_info ?? {};
       const k = Object.keys(mi).find((x) => x.endsWith('.context_length'));
-      ctx = k ? Number(mi[k]) : undefined;
+      const declared = k ? Number(mi[k]) : NaN;
+      const configured = Number(/^num_ctx\s+(\d+)\s*$/m.exec(String(show.parameters ?? ''))?.[1]);
+      const running = loaded.find((entry) => entry.name === m.name)?.contextLength ?? NaN;
+      const known = [declared, configured, running].filter((n) => Number.isSafeInteger(n) && n > 0);
+      ctx = known.length ? Math.min(...known) : undefined;
     } catch {
       /* show failed: compatibility unknown */
     }

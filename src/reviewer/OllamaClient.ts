@@ -1,6 +1,6 @@
 /**
  * Minimal Ollama HTTP client (https://github.com/ollama/ollama/blob/main/docs/api.md).
- * Uses only: GET /api/version, GET /api/tags, POST /api/chat (streaming NDJSON).
+ * Uses only: GET /api/version, GET /api/tags, POST /api/show (metadata, no inference), POST /api/chat (streaming NDJSON).
  * Never pulls/deletes models and never changes Ollama configuration.
  */
 
@@ -42,6 +42,13 @@ export interface ChatResult {
   promptTokens?: number;
   outputTokens?: number;
   totalDurationMs?: number;
+  /** Ollama's done_reason ("stop", "length", …). "length" means the answer was cut off. */
+  doneReason?: string;
+}
+
+export interface ModelInfo {
+  /** The model's trained context length (model_info.<arch>.context_length), if reported. */
+  contextLength?: number;
 }
 
 type FetchLike = typeof fetch;
@@ -110,6 +117,31 @@ export class OllamaClient {
         quantization: m.details?.quantization_level,
       }))
       .filter((m) => m.name);
+  }
+
+  /** Model metadata (POST /api/show). Does not load the model or run inference. */
+  async show(model: string, signal?: AbortSignal): Promise<ModelInfo> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.base}/api/show`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model }),
+        signal: signal ?? AbortSignal.timeout(5000),
+      });
+    } catch (err) {
+      throw this.wrap(err);
+    }
+    if (!res.ok) throw new OllamaError(res.status === 404 ? 'model-not-found' : 'http', `Ollama returned ${res.status} for /api/show`);
+    let body: { model_info?: Record<string, unknown> };
+    try {
+      body = (await res.json()) as typeof body;
+    } catch {
+      throw new OllamaError('protocol', 'Ollama returned invalid JSON for /api/show');
+    }
+    const key = Object.keys(body.model_info ?? {}).find((k) => /.context_length$/.test(k));
+    const value = key ? Number(body.model_info![key]) : NaN;
+    return { contextLength: Number.isFinite(value) && value > 0 ? value : undefined };
   }
 
   /** Streaming chat. `onDelta` receives content and thinking tokens as they arrive. */
@@ -195,6 +227,7 @@ export class OllamaClient {
     if (chunk.done) {
       result.promptTokens = chunk.prompt_eval_count;
       result.outputTokens = chunk.eval_count;
+      result.doneReason = typeof chunk.done_reason === 'string' ? chunk.done_reason : undefined;
       result.totalDurationMs = typeof chunk.total_duration === 'number' ? Math.round(chunk.total_duration / 1e6) : undefined;
     }
   }

@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+import { PromptAttachment, attachmentText } from '../attachments';
 import { AdapterCapabilities, AgentTaskContext, OperationSink, StreamingAgentAdapter, StreamingRunResult } from '../../adapters/AgentAdapter';
 import { NormalizedEventApplier } from '../../adapters/normalizedEvents';
 import { DESTRUCTIVE_COMMAND, insideWorkspace, isSensitive, mapToolCall, readTextSafe, relPath, str } from '../toolMapping';
@@ -9,7 +11,7 @@ import { SOURCE_EDIT_POLICY } from '../editPolicy';
  */
 export interface SdkUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | any[] };
   parent_tool_use_id: null;
 }
 export type SdkPermissionResult =
@@ -32,7 +34,16 @@ export interface ClaudeAdapterOptions {
   env: NodeJS.ProcessEnv;
   pathToClaudeCodeExecutable?: string;
   readText?: (p: string) => string | undefined;
+  /** Claude Code session of this conversation to resume; a new session is started if it cannot be resumed. */
+  resumeSessionId?: string;
+  /** Compact summary used only when the session cannot be resumed (marked as reconstructed). */
+  reconstructedContext?: (reason?: string) => string;
+  /** Set when this session starts from a reconstructed summary (the prompt already contains it): recorded as reconstructed. */
+  reconstructedReason?: string;
 }
+
+/** Resuming the conversation's session failed before it started (nothing was sent to the model). */
+class ResumeFailed extends Error {}
 
 export interface ClaudeAuthentication { ok: boolean; kind?: 'subscription' | 'api-key' | 'cloud'; method?: string; reason?: string }
 export interface ClaudeLoginStatus { loggedIn?: boolean; authMethod?: string; subscriptionType?: string; apiProvider?: string }
@@ -67,8 +78,8 @@ class InputQueue implements AsyncIterable<SdkUserMessage> {
   private items: SdkUserMessage[] = [];
   private waiter: ((v: IteratorResult<SdkUserMessage>) => void) | undefined;
   private closed = false;
-  push(text: string): void {
-    const msg: SdkUserMessage = { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null };
+  push(text: string, attachments: PromptAttachment[] = []): void {
+    const msg: SdkUserMessage = { type: 'user', message: { role: 'user', content: attachments.length ? [{ type: 'text', text: attachmentText(text, attachments) }, ...attachments.filter((a) => a.mime.startsWith('image/')).map((a) => ({ type: 'image', source: { type: 'base64', media_type: a.mime, data: a.data } }))] : text }, parent_tool_use_id: null };
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = undefined;
@@ -107,7 +118,9 @@ class InputQueue implements AsyncIterable<SdkUserMessage> {
  *   where Visual Agent intercepts (real blocking).
  * - Isolated: `settingSources: []` (no user/project settings, hooks or
  *   CLAUDE.md permission rules are loaded or modified).
- * - Multi-turn: streaming input; follow-ups continue the same session.
+ * - Multi-turn: streaming input; follow-ups continue the same session. The
+ *   session is persisted by Claude Code, so a later session resumes it
+ *   (`resume`) instead of replaying the conversation.
  */
 export class ClaudeCodeAdapter implements StreamingAgentAdapter {
   readonly kind = 'streaming' as const;
@@ -126,6 +139,9 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
   private ended: 'completed' | 'interrupted' | undefined;
   private authentication?: ClaudeAuthentication;
   private readonly announced = new Set<string>();
+  private resuming: string | undefined;
+  private recoveryReason: string | undefined;
+  private initSeen = false;
 
   constructor(private readonly options: ClaudeAdapterOptions) {
     this.displayName = `Claude Code · ${options.model} (${options.profile === 'read-only' ? 'read-only' : 'approve edits & commands'})`;
@@ -147,6 +163,22 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
     this.root = ctx.workspaceRoot;
     this.sink = sink;
     this.applier = new NormalizedEventApplier(sink);
+    try {
+      return await this.attempt(ctx, sink, auth, this.options.resumeSessionId);
+    } catch (err) {
+      if (!(err instanceof ResumeFailed)) throw err;
+      // The native session is gone or belongs elsewhere: a new session with a short, labelled summary.
+      this.recoveryReason = err.message;
+      sink.log(`[claude] session ${this.options.resumeSessionId} could not be resumed: ${err.message}`);
+      this.ended = undefined;
+      this.abort = new AbortController();
+      return this.attempt(ctx, sink, auth, undefined);
+    }
+  }
+
+  private async attempt(ctx: AgentTaskContext, sink: OperationSink, auth: ClaudeAuthentication, resume: string | undefined): Promise<StreamingRunResult> {
+    this.resuming = resume;
+    this.initSeen = false;
     const queryFn = await this.options.loadQuery();
     this.input = new InputQueue();
     const readOnly = this.options.profile === 'read-only';
@@ -166,7 +198,9 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
         canUseTool: (toolName: string, input: Record<string, unknown>, o: { signal: AbortSignal; toolUseID: string }) => this.canUseTool(toolName, input, o.toolUseID),
         abortController: this.abort,
         env: this.options.env,
-        persistSession: false,
+        // Stored by Claude Code (its own session store) so the conversation can be resumed natively later.
+        persistSession: true,
+        ...(resume ? { resume } : {}),
         ...(this.options.pathToClaudeCodeExecutable ? { pathToClaudeCodeExecutable: this.options.pathToClaudeCodeExecutable } : {}),
       },
     });
@@ -186,14 +220,20 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
       if (auth.kind === 'cloud' && info.apiProvider !== cloudProvider) throw new Error('The selected Claude cloud authentication was not confirmed. No task prompt was sent.');
       const authOp = sink.announce({ operationType: 'Analyze', description: `Claude authentication confirmed: ${auth.method}` });
       sink.complete(authOp, { outcome: 'Completed', resultSummary: `Authentication: ${auth.kind}. Provider: ${info.apiProvider ?? 'firstParty'}${info.subscriptionType ? `; plan: ${info.subscriptionType}` : ''}.` });
-      this.input.push(ctx.description);
+      const first = !resume && this.recoveryReason && this.options.reconstructedContext ? this.options.reconstructedContext(this.recoveryReason) + ctx.description : ctx.description;
+      this.input.push(first, ctx.attachments);
       for await (const msg of this.q) {
+        if (resume && msg.type === 'system' && msg.subtype === 'init' && msg.cwd && path.resolve(String(msg.cwd)).toLowerCase() !== path.resolve(ctx.workspaceRoot).toLowerCase()) {
+          throw new ResumeFailed(`the session belongs to another project (${msg.cwd})`);
+        }
         this.onMessage(msg);
       }
+      if (resume && !this.initSeen && !this.ended) throw new ResumeFailed('Claude Code ended without starting the session');
     } catch (err) {
       if (this.ended) {
         return { outcome: this.ended };
       }
+      if (resume && !this.initSeen && !(err instanceof ResumeFailed)) throw new ResumeFailed((err as Error).message ?? String(err));
       throw err;
     } finally {
       this.input.close();
@@ -202,12 +242,12 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
     return { outcome: this.ended ?? 'completed' };
   }
 
-  async steer(text: string): Promise<void> {
+  async steer(text: string, attachments?: PromptAttachment[]): Promise<void> {
     if (!this.input) {
       throw new Error('Claude Code session is not running.');
     }
     this.sink?.setAwaitingInput?.(false);
-    this.input.push(text);
+    this.input.push(text, attachments);
   }
 
   async interrupt(): Promise<void> {
@@ -231,9 +271,14 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
   private onMessage(msg: any): void {
     const sink = this.sink!;
     if (msg.type === 'system' && msg.subtype === 'init') {
+      this.initSeen = true;
+      const reason = this.recoveryReason ?? this.options.reconstructedReason;
+      const continuity = this.resuming ? 'resumed' : reason ? 'reconstructed' : 'new';
+      if (msg.session_id) sink.setSession?.({ provider: 'claude-code', id: String(msg.session_id), continuity, ...(reason && !this.resuming ? { recoveryReason: reason } : {}) });
+      const how = continuity === 'resumed' ? 'Claude Code session resumed (native context kept)' : continuity === 'reconstructed' ? 'New Claude Code session with reconstructed context (the previous session could not be resumed)' : 'Claude Code session started';
       const op = sink.announce({
         operationType: 'Analyze',
-        description: `Claude Code session started: ${msg.model ?? this.options.model} (Claude Code ${msg.claude_code_version ?? '?'})`,
+        description: `${how}: ${msg.model ?? this.options.model} (Claude Code ${msg.claude_code_version ?? '?'})`,
         rationale: this.boundary,
         externalId: msg.session_id,
       });
@@ -283,6 +328,8 @@ export class ClaudeCodeAdapter implements StreamingAgentAdapter {
         outcome: msg.is_error ? 'Failed' : 'Completed',
         resultSummary: `${msg.num_turns ?? '?'} model turns, ${msg.duration_ms ?? '?'} ms${typeof msg.total_cost_usd === 'number' ? `, SDK usage estimate $${msg.total_cost_usd.toFixed(4)} (${this.authentication?.kind === 'subscription' ? 'subscription quota; not an API invoice' : 'API billing'})` : ''}.`,
       });
+      const u = msg.usage as { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number } | undefined;
+      if (u) sink.reportUsage?.({ inputTokens: u.input_tokens, outputTokens: u.output_tokens, cachedInputTokens: u.cache_read_input_tokens });
       sink.setAwaitingInput?.(true);
     }
   }

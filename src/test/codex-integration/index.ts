@@ -3,7 +3,7 @@
  * workspace is a DISPOSABLE git repository created by
  * scripts/run-codex-integration.js. Uses the developer's Codex login/quota.
  *
- * VAW_CODEX_SUITE = "readonly" (default) | "edits" | "all"
+ * VAW_CODEX_SUITE = "readonly" (default) | "edits" | "multi" | "session" | "all"
  */
 import * as vscode from 'vscode';
 import * as assert from 'node:assert/strict';
@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import type { VisualAgentApi } from '../../extension';
 import type { AgentOperation } from '../../types/events';
 
-type Case = [string, 'readonly' | 'edits', (api: VisualAgentApi) => Promise<void>];
+type Case = [string, 'readonly' | 'edits' | 'multi' | 'session', (api: VisualAgentApi) => Promise<void>];
 const TURN_TIMEOUT = 240_000;
 
 function root(): string {
@@ -41,7 +41,9 @@ function describeOps(ops: AgentOperation[]): string {
     .join('\n');
 }
 async function finish(api: VisualAgentApi, taskId: string): Promise<AgentOperation[]> {
-  await waitUntil(() => !api.controller.isActive, 'task end');
+  // Codex sessions are multi-turn: the turn ends with "waiting for input"; then the session is ended.
+  await waitUntil(() => !api.controller.isActive || api.controller.getSnapshot().awaitingInput, 'turn end');
+  if (api.controller.isActive) await api.controller.endSession();
   await api.controller.whenIdle();
   const ops = api.recorder.getOperations(taskId);
   console.log(`    task ${api.recorder.getTask(taskId)!.status}\n${describeOps(ops)}`);
@@ -268,7 +270,358 @@ const cases: Case[] = [
       assert.equal(gitStatus(), 'M validation.py', 'only the approved file changed');
     },
   ],
+  // ---------------------------------------------------- multi-file edit before applying (real Codex patch)
+  [
+    'multi-file: edit a real Codex patch before applying (switch, keep edits, reset, exclude deletion, preview, conflict, rollback, cancel, apply); later proposals cannot overwrite the applied version',
+    'multi',
+    async (api) => {
+      const { controller, recorder, controls } = api;
+      const file = (rel: string) => path.join(root(), rel);
+      const read = (rel: string) => (fs.existsSync(file(rel)) ? fs.readFileSync(file(rel), 'utf8') : undefined);
+      // A committed file the patch will delete.
+      fs.writeFileSync(file('legacy_notes.txt'), 'Old notes that the agent will propose to delete.\n');
+      execFileSync('git', ['add', 'legacy_notes.txt'], { cwd: root() });
+      execFileSync('git', ['commit', '-q', '-m', 'add legacy notes'], { cwd: root() });
+      const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root(), encoding: 'utf8' }).trim();
+      const original = { validation: read('validation.py')!, importer: read('importer.py')!, legacy: read('legacy_notes.txt')! };
+      const timings: Record<string, number> = {};
+      const timed = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
+        const t = Date.now();
+        const r = await fn();
+        timings[name] = Date.now() - t;
+        return r;
+      };
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      // Started like the New Agent Task panel does, so the conversation can be continued (protection is per conversation).
+      const models = await api.launcher.models('codex', root());
+      const model = models.find((m) => m.isDefault && m.compatible) ?? models.find((m) => m.compatible)!;
+      console.log(`    Codex model: ${model.id}`);
+      const taskId = (await api.launcher.start({
+        provider: 'codex',
+        model: model.id,
+        effort: model.efforts?.includes('low') ? 'low' : model.defaultEffort,
+        profile: 'approve-edits',
+        workspaceRoot: root(),
+        instructions:
+          'Make ALL of the following changes together in ONE single apply_patch call (one patch touching four files; not a shell command, no separate patches): ' +
+          "(1) add the line '# multi-file edit test' as the first line of validation.py; (2) add the line '# multi-file edit test' as the first line of importer.py; " +
+          "(3) create a new file NOTES.md containing exactly the line '# Notes'; (4) delete the file legacy_notes.txt. Do not run any commands. " +
+          'If the patch is declined, do not retry it; wait for further instructions.',
+      }))!;
+      assert.ok(taskId, 'Codex conversation started');
+      await vscode.commands.executeCommand('visualAgent.openConversations', taskId);
+      // Wait for a multi-file patch. If Codex splits the work, ask once more for a single patch.
+      let p1: string | undefined;
+      for (let attempt = 0; attempt < 3 && !p1; attempt++) {
+        const id = await waitUntil(() => controller.getSnapshot().pendingApprovals.find((x) => recorder.getOperation(x)?.operationType === 'Edit' || recorder.getOperation(x)?.command), 'patch approval');
+        const op = recorder.getOperation(id)!;
+        const n = op.associatedChangeIds?.length ?? (op.associatedChangeId ? 1 : 0);
+        console.log(`    proposal: ${op.description} (${n} file(s))`);
+        if (op.operationType === 'Edit' && n >= 2) p1 = id;
+        else controller.reject(id, 'Please put ALL four changes into ONE single apply_patch call (one patch with all four files).');
+      }
+      assert.ok(p1, 'Codex proposed one patch touching several files');
+      const files = () => controls.proposals.editState(p1!)!.files;
+      const ids = recorder.getOperation(p1)!.associatedChangeIds!;
+      console.log(`    files: ${ids.map((id) => `${api.recorder.getChange(id)?.filePath}`).join(', ')}`);
+      assert.equal(gitStatus(), '', 'nothing written before any decision');
+
+      // Cancel first: nothing written, still pending.
+      await ConversationPanelReceive({ type: 'action', action: 'editProposal', operationId: p1 });
+      await waitUntil(() => controls.proposals.isEditing(p1!), 'editing', 15_000);
+      await screenshot('01-file-list');
+      await ConversationPanelReceive({ type: 'action', action: 'cancelEdit', operationId: p1 });
+      assert.equal(controls.proposals.isEditing(p1), false);
+      assert.ok(controller.getSnapshot().pendingApprovals.includes(p1), 'cancel keeps the proposal pending');
+      assert.equal(gitStatus(), '', 'cancel wrote nothing');
+
+      // Edit again.
+      await timed('open editing (first file)', () => ConversationPanelReceive({ type: 'action', action: 'editProposal', operationId: p1 }));
+      await waitUntil(() => controls.proposals.isEditing(p1!), 'editing again', 15_000);
+      const idx = (rel: string) => files().findIndex((f) => f.rel === rel);
+      const iv = idx('validation.py'), ii = idx('importer.py'), inotes = idx('NOTES.md'), ilegacy = idx('legacy_notes.txt');
+      console.log(`    file list: ${files().map((f) => `${f.rel} [${f.kind}${f.editable ? '' : ', not editable'}] +${f.added} −${f.removed}`).join('; ')}`);
+      assert.ok(iv >= 0 && ii >= 0, 'both Python files are in the patch');
+      const copy = (rel: string) => waitUntil(() => vscode.workspace.textDocuments.find((d) => d.uri.fsPath.includes(path.join('proposals', p1!)) && d.uri.fsPath.endsWith(rel)), `${rel} copy`, 15_000);
+      const setDoc = async (doc: vscode.TextDocument, text: string) => {
+        const we = new vscode.WorkspaceEdit();
+        we.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), text);
+        await vscode.workspace.applyEdit(we);
+      };
+      const USER_LINE = '# edited by the user: keep this line';
+      await timed('switch to validation.py', () => ConversationPanelReceive({ type: 'editFile', operationId: p1, index: iv }));
+      const vDoc = await copy('validation.py');
+      const vMine = vDoc.getText().replace(/\n?$/, `\n${USER_LINE}\n`);
+      await setDoc(vDoc, vMine);
+      await timed('switch to importer.py', () => ConversationPanelReceive({ type: 'editFile', operationId: p1, index: ii }));
+      await waitUntil(() => files()[ii].active, 'switched', 10_000);
+      assert.equal(files()[iv].edited, true, 'validation.py edits kept after switching');
+      const iDoc = await copy('importer.py');
+      await setDoc(iDoc, iDoc.getText() + '# temporary edit\n');
+      await waitUntil(() => files()[ii].edited, 'importer edited', 10_000);
+      await screenshot('02-editing-importer');
+      await timed('reset importer.py', () => ConversationPanelReceive({ type: 'resetEditFile', operationId: p1, index: ii }));
+      assert.equal(files()[ii].edited, false, 'reset importer.py to the proposal');
+      assert.equal(files()[iv].edited, true, 'validation.py still edited');
+      await timed('switch back to validation.py', () => ConversationPanelReceive({ type: 'editFile', operationId: p1, index: iv }));
+      assert.equal(eol(vDoc.getText()), eol(vMine), 'validation.py edit preserved across switches');
+      if (inotes >= 0) {
+        await ConversationPanelReceive({ type: 'editFile', operationId: p1, index: inotes });
+        const nDoc = await copy('NOTES.md');
+        await setDoc(nDoc, '# Notes\n\nWritten by the user.\n');
+      }
+      if (ilegacy >= 0) {
+        await ConversationPanelReceive({ type: 'excludeDeletion', operationId: p1, index: ilegacy, excluded: true });
+        assert.equal(files()[ilegacy].excluded, true);
+      } else console.log('    NOTE: Codex did not include the deletion; the exclusion check is skipped');
+      // Combined preview (first apply).
+      await timed('apply #1 → combined preview', () => ConversationPanelReceive({ type: 'action', action: 'applyEdited', operationId: p1 }));
+      const preview = await waitUntil(() => vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'visual-agent-edit-preview' && d.uri.path.includes(p1!)), 'combined preview', 10_000);
+      assert.match(preview.getText(), new RegExp(USER_LINE));
+      if (ilegacy >= 0) assert.match(preview.getText(), /legacy_notes\.txt\n\(deletion excluded by you/);
+      await screenshot('03-combined-preview');
+      assert.equal(gitStatus(), '', 'preview wrote nothing');
+      // Conflict: importer.py changed on disk.
+      fs.writeFileSync(file('importer.py'), original.importer + '# changed outside\n');
+      await assert.rejects(controls.proposals.applyEditedVersion(p1), /Not applied: importer\.py changed on disk[\s\S]*Nothing was written/);
+      fs.writeFileSync(file('importer.py'), original.importer);
+      assert.equal(read('validation.py'), original.validation, 'conflict: nothing written');
+      // Rollback: the second write fails.
+      const realStore = controls.proposals.fileStore;
+      let writes = 0;
+      controls.proposals.fileStore = { ...realStore, write: async (abs, text) => { if (++writes === 2) throw new Error('injected write failure'); await realStore.write(abs, text); } };
+      await assert.rejects(controls.proposals.applyEditedVersion(p1), /injected write failure[\s\S]*restored/);
+      controls.proposals.fileStore = realStore;
+      assert.equal(gitStatus(), '', 'rollback: working tree exactly as before');
+      // Apply (explicit, previewed content).
+      const ok = await timed('apply #2 (write)', () => controls.proposals.applyEditedVersion(p1!));
+      assert.equal(ok, true);
+      assert.ok(read('validation.py')!.includes(USER_LINE), 'user version of validation.py on disk');
+      assert.ok(read('importer.py')!.includes('# multi-file edit test') && !read('importer.py')!.includes('# temporary edit'), 'importer.py: the proposed version (the temporary edit was reset)');
+      if (inotes >= 0) assert.equal(read('NOTES.md'), '# Notes\n\nWritten by the user.\n');
+      if (ilegacy >= 0) assert.equal(read('legacy_notes.txt'), original.legacy, 'excluded deletion: file kept');
+      console.log(`    git status after apply:\n${gitStatus().replace(/^/gm, '      ')}`);
+      await screenshot('04-applied');
+
+      // The agent must not overwrite the applied version. In a follow-up turn of the SAME conversation,
+      // ask Codex explicitly to remove the user's line and delete the kept file.
+      await waitUntil(() => !controller.getSnapshot().pendingApprovals.includes(p1!), 'agent write declined', 10_000);
+      for (let i = 0; i < 20 && controller.isActive && !controller.getSnapshot().awaitingInput; i++) {
+        const id = controller.getSnapshot().pendingApprovals[0];
+        if (id) controller.reject(id, 'Wait for further instructions.');
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      if (controller.isActive) {
+        if (controller.getSnapshot().awaitingInput) await controller.endSession();
+        else controller.stop();
+        await controller.whenIdle();
+      }
+      console.log(`    first turn:\n${describeOps(recorder.getOperations(taskId))}`);
+      assert.equal(
+        await api.launcher.send(taskId, `Using your apply_patch tool, remove the line '${USER_LINE}' from validation.py and delete the file legacy_notes.txt, in one patch. Do not run commands.`),
+        true,
+        'follow-up sent in the same conversation',
+      );
+      const blocked: string[] = [];
+      const deadline = Date.now() + 180_000;
+      while (controller.isActive && !controller.getSnapshot().awaitingInput && Date.now() < deadline) {
+        const id = controller.getSnapshot().pendingApprovals[0];
+        if (!id) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+        const op = recorder.getOperation(id)!;
+        const c = await controls.proposals.check(id);
+        console.log(`    later proposal: ${op.description} → ${c.ok ? 'no conflict' : controls.proposals.describe(c)}`);
+        if (!c.ok) {
+          blocked.push(controls.proposals.describe(c));
+          // Approving is refused before anything is written.
+          await controls.runAction('approve', id);
+          await controls.runAction('approve', id);
+          assert.ok(controller.getSnapshot().pendingApprovals.includes(id), 'approval refused');
+        }
+        controller.reject(id, 'Keep the user version. Stop now.');
+      }
+      if (controller.isActive) {
+        controller.stop();
+        await controller.whenIdle();
+      }
+      console.log(`    follow-up turn:\n${describeOps(recorder.getOperations(taskId).slice(-8))}`);
+      console.log(`    blocked later proposals: ${blocked.length ? blocked.join(' | ') : '(Codex proposed none)'}`);
+      if (process.env.VAW_REQUIRE_BLOCK === '1') assert.ok(blocked.length, 'Codex proposed an overwrite and it was blocked');
+      assert.ok(read('validation.py')!.includes(USER_LINE), 'the user line survived');
+      if (ilegacy >= 0) assert.equal(read('legacy_notes.txt'), original.legacy, 'the kept file survived');
+      console.log(`    timings (ms): ${Object.entries(timings).map(([k, v]) => `${k} ${v}`).join(' · ')}`);
+      for (const [k, v] of Object.entries(timings)) assert.ok(v < 3000, `${k} responded in ${v} ms`);
+      // Leave the repository clean for the next case.
+      execFileSync('git', ['reset', '-q', '--hard', head], { cwd: root() });
+      execFileSync('git', ['clean', '-qfd'], { cwd: root() });
+      execFileSync('git', ['reset', '-q', '--hard', 'HEAD~1'], { cwd: root() });
+    },
+  ],
+
+  // ---------------------------------------------------- native session continuity (real Codex)
+  [
+    'session: inspect → modify → explain in ONE native thread; external edit is re-read; restart resumes the thread; a second conversation is isolated; compared with the old new-thread-plus-replay path',
+    'session',
+    async (api) => {
+      const { controller, recorder, launcher, sessions } = api;
+      const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root(), encoding: 'utf8' }).trim();
+      const models = await launcher.models('codex', root());
+      const model = models.find((m) => m.isDefault && m.compatible) ?? models.find((m) => m.compatible)!;
+      const sel = { provider: 'codex' as const, model: model.id, effort: model.efforts?.includes('low') ? 'low' : model.defaultEffort, profile: 'approve-edits', workspaceRoot: root() };
+      console.log(`    Codex model: ${model.id} (effort ${sel.effort})`);
+      // Approvals: read-only commands and the requested patch to validation.py; everything else declined.
+      const { describeCommand } = await import('../../analysis/commandInfo');
+      const decided = new Set<string>();
+      const sweeper = setInterval(() => {
+        for (const id of controller.getSnapshot().pendingApprovals) {
+          if (decided.has(id)) continue;
+          decided.add(id);
+          const op = recorder.getOperation(id)!;
+          if (op.command && !describeCommand(op.command.command).writes) controller.approve(id);
+          else if (op.operationType === 'Edit' && op.filePath === 'validation.py') controller.approve(id);
+          else controller.reject(id, 'Not needed for this test.');
+        }
+      }, 150);
+      const turnDone = async (what: string) => {
+        await new Promise((r) => setTimeout(r, 300));
+        await waitUntil(() => controller.getSnapshot().awaitingInput || !controller.isActive, what);
+      };
+      const answer = (taskId: string) => recorder.getTask(taskId)?.messages?.filter((m) => m.role === 'assistant').at(-1)?.text ?? '';
+      const opsSince = (taskId: string, seq: number) => recorder.getOperations(taskId).filter((o) => o.sequenceNumber > seq);
+      const lastSeq = (taskId: string) => recorder.getOperations(taskId).at(-1)?.sequenceNumber ?? 0;
+      const prompts = {
+        inspect: 'Read validation.py with ONE read-only shell command and tell me in two sentences what validate_samples() checks. Do not modify anything.',
+        modify: "Using your apply_patch tool (not a shell command), add the comment line '# checked by visual agent' directly above the def validate_samples line in validation.py. Change nothing else and run no commands.",
+        explain: 'In one sentence: why did you put the comment exactly there? Do not run any commands.',
+      };
+      try {
+        // ---- Native: three messages in one conversation.
+        const a = (await launcher.start({ ...sel, instructions: prompts.inspect }))!;
+        await turnDone('turn 1');
+        const thread = recorder.getTask(a)!.session!.id;
+        console.log(`    thread ${thread}; turn 1: ${answer(a).slice(0, 120)}`);
+        assert.equal(await launcher.send(a, prompts.modify), true);
+        await turnDone('turn 2');
+        assert.ok(fs.readFileSync(path.join(root(), 'validation.py'), 'utf8').includes('# checked by visual agent'), 'patch applied after approval');
+        const seq3 = lastSeq(a);
+        assert.equal(await launcher.send(a, prompts.explain), true);
+        await turnDone('turn 3');
+        console.log(`    turn 3: ${answer(a).slice(0, 160)}`);
+        const native = sessions.metrics(a);
+        console.log(`    native metrics: ${sessions.describe(a)}`);
+        assert.equal(recorder.getTask(a)!.session!.id, thread, 'same native thread for all three turns');
+        assert.deepEqual([native.threadsStarted, native.threadsResumed, native.nativeTurns], [1, 0, 2]);
+        assert.ok(!opsSince(a, seq3).some((o) => /Codex session started|thread resumed/.test(o.description)), 'no new session for the follow-up');
+        const turn3Reads = opsSince(a, seq3).filter((o) => o.operationType === 'Read');
+        console.log(`    turn 3 tool steps: ${opsSince(a, seq3).filter((o) => o.command || o.operationType === 'Read').map((o) => o.description).join(' | ') || '(none)'}`);
+
+        // ---- Test C: the user edits validation.py; the next message names it and the agent reads the new version.
+        fs.appendFileSync(path.join(root(), 'validation.py'), '# user note: zero concentration is allowed\n');
+        const seq4 = lastSeq(a);
+        assert.equal(await launcher.send(a, 'What does the very last line of validation.py say now? Quote it.'), true);
+        await turnDone('turn 4');
+        const instruct4 = recorder.getOperations(a).filter((o) => o.operationType === 'Instruct').at(-1)!;
+        assert.match(instruct4.rationale ?? '', /Context update from the editor: .*validation\.py \(modified\)/s, 'the change note was sent');
+        console.log(`    turn 4 (after external edit): ${answer(a).slice(0, 160)} | reads: ${opsSince(a, seq4).filter((o) => o.operationType === 'Read').map((o) => o.filePath).join(', ')}`);
+        assert.match(answer(a), /zero concentration is allowed/, 'the agent used the current version');
+
+        // ---- Test D: the session ends (as on reload / restart); the next message resumes the SAME thread.
+        await controller.endSession();
+        await controller.whenIdle();
+        assert.equal(await launcher.send(a, 'Without running commands: which function did we add a comment to earlier in this conversation? One word.'), true);
+        await turnDone('turn after restart');
+        assert.equal(recorder.getTask(a)!.session!.id, thread, 'resumed the same thread');
+        assert.equal(recorder.getTask(a)!.session!.continuity, 'resumed');
+        console.log(`    after restart (resumed ${thread}): ${answer(a).slice(0, 120)}`);
+        assert.match(answer(a), /validate_samples/, 'native context survived the restart');
+        await controller.endSession();
+        await controller.whenIdle();
+
+        // ---- Test E: a second conversation in the same workspace has its own thread.
+        const b = (await launcher.start({ ...sel, instructions: 'Without running any command: do you know of any change we made in this repository? Answer yes or no.' }))!;
+        await turnDone('conversation B');
+        assert.notEqual(recorder.getTask(b)!.session!.id, thread, 'isolated thread');
+        console.log(`    conversation B thread ${recorder.getTask(b)!.session!.id}: ${answer(b).slice(0, 80)}`);
+        await controller.endSession();
+        await controller.whenIdle();
+
+        // ---- Before: the old path (a new thread per message + the saved-conversation replay) for the same three messages.
+        execFileSync('git', ['checkout', '-q', '--', 'validation.py'], { cwd: root() });
+        decided.clear();
+        const { continuationContext } = await import('../../recorder/conversation');
+        const old = (await launcher.start({ ...sel, instructions: prompts.inspect }))!;
+        await turnDone('old turn 1');
+        for (const msg of [prompts.modify, prompts.explain]) {
+          await controller.endSession();
+          await controller.whenIdle();
+          const task = recorder.getTask(old)!;
+          // Exactly what the extension did before this change.
+          controller.start(continuationContext(task, recorder.getOperations(old)) + msg, launcher.createAdapter({ ...sel, instructions: msg }, model), root(), { taskId: old, userMessage: msg });
+          await turnDone('old follow-up');
+        }
+        const before = sessions.metrics(old);
+        console.log(`    old-path metrics: ${sessions.describe(old)}`);
+        const nat = sessions.metrics(a);
+        console.log('    COMPARISON (3-message workflow) native vs old:');
+        console.log(`      threads started ${native.threadsStarted} vs ${before.threadsStarted}`);
+        console.log(`      reads (repeated) ${native.reads} (${native.repeatedReads}) vs ${before.reads} (${before.repeatedReads})`);
+        console.log(`      exploration ${native.explorations} vs ${before.explorations}`);
+        console.log(`      input tokens ${native.inputTokens} (cached ${native.cachedInputTokens}) vs ${before.inputTokens} (cached ${before.cachedInputTokens}); output ${native.outputTokens} vs ${before.outputTokens}`);
+        console.log(`      [native totals incl. turns 4-5: ${nat.inputTokens} in]`);
+        void turn3Reads;
+        assert.equal(before.threadsStarted, 3, 'the old path started a thread per message');
+      } finally {
+        clearInterval(sweeper);
+        if (controller.isActive) {
+          if (controller.getSnapshot().awaitingInput) await controller.endSession();
+          else controller.stop();
+          await controller.whenIdle();
+        }
+        execFileSync('git', ['reset', '-q', '--hard', head], { cwd: root() });
+        execFileSync('git', ['clean', '-qfd'], { cwd: root() });
+      }
+    },
+  ],
 ];
+
+const eol = (s: string) => s.replace(/\r\n/g, '\n');
+
+async function ConversationPanelReceive(m: unknown): Promise<void> {
+  const { ConversationPanel } = await import('../../ui/ConversationPanel');
+  await ConversationPanel.receive(m);
+}
+
+/** Capture the Extension Development Host window (PrintWindow) when VAW_SCREENSHOT_DIR is set. */
+async function screenshot(name: string): Promise<void> {
+  const dir = process.env.VAW_SCREENSHOT_DIR;
+  if (!dir || process.platform !== 'win32') return;
+  // Bring the conversation panel (approval card + file list) to the front beside the editors.
+  await vscode.commands.executeCommand('visualAgent.openConversations');
+  await new Promise((r) => setTimeout(r, 1200)); // let the webview render
+  const out = path.join(dir, `${name}.png`);
+  const title = path.basename(root());
+  const ps = `
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class W { [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out R r); [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
+public struct R { public int L, T, Ri, B; } }
+"@
+$p = Get-Process | Where-Object { $_.MainWindowTitle -like '*${title}*' } | Select-Object -First 1
+if (-not $p) { exit 2 }
+$r = New-Object W+R; [W]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
+$b = New-Object System.Drawing.Bitmap ($r.Ri - $r.L), ($r.B - $r.T)
+$g = [System.Drawing.Graphics]::FromImage($b); $dc = $g.GetHdc(); [W]::PrintWindow($p.MainWindowHandle, $dc, 2) | Out-Null; $g.ReleaseHdc($dc)
+$b.Save('${out.replace(/'/g, "''")}'); "$($r.Ri - $r.L)x$($r.B - $r.T)"`;
+  try {
+    const size = execFileSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8', timeout: 20_000 }).trim();
+    console.log(`    screenshot ${out} (${size})`);
+  } catch (err) {
+    console.log(`    screenshot ${name} failed: ${(err as Error).message.split('\n')[0]}`);
+  }
+}
 
 export async function run(): Promise<void> {
   const ext = vscode.extensions.all.find((e) => e.packageJSON?.name === 'visual-agent-workspace');

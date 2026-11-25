@@ -87,14 +87,7 @@ export function describeCommand(command: string): CommandInfo {
   const summaries: Array<{ label: string; kind: CommandInfo['kind'] }> = [];
   const heredoc = /<<-?\s*['"]?\w+['"]?/.test(text);
   const inlineScript = /\b(python3?|py|node|deno|ruby|perl|php|bash|sh|pwsh|powershell)(\.exe)?\s+(-c|-e|--eval|-Command)\b/i.test(text);
-
-  // Redirections to files (not >&2, not /dev/null, not NUL).
-  for (const m of text.matchAll(/(?<![<>&\d])(\d?>>?|&>)\s*("[^"]+"|'[^']+'|[^\s;&|<>]+)/g)) {
-    const target = m[2].replace(/^["']|["']$/g, '');
-    if (/^&\d$|^\/dev\/(null|stdout|stderr)$|^nul$/i.test(target) || /^&/.test(target)) continue;
-    writeTargets.push(target);
-    writeReasons.push(`redirects output to ${target}`);
-  }
+  const explicit = detectShellWrites(text);
   for (const simple of parts) {
     const w = words(simple);
     let i = 0;
@@ -106,11 +99,13 @@ export function describeCommand(command: string): CommandInfo {
     const lower = prog.toLowerCase();
     if (!prog || /^(cd|pushd|popd|set-location|sl|chdir)$/i.test(prog)) continue; // navigation is not a step
     // `cat/echo/printf ... > file`: the purpose is writing that file.
-    const redirect = /(?<![<>&\d])(?:\d?>>?|&>)\s*("[^"]+"|'[^']+'|[^\s;&|<>]+)/.exec(simple);
-    const redirectTarget = redirect?.[1].replace(/^["']|["']$/g, '');
-    if (redirectTarget && !/^&|^\/dev\/|^nul$/i.test(redirectTarget) && /^(cat|echo|printf|type|Write-Output|tee)$/i.test(prog)) {
-      summaries.push({ label: `Write ${redirectTarget} (${prog})`, kind: 'write' });
-      continue;
+    if (/^(cat|echo|printf|type|Write-Output|tee)$/i.test(prog)) {
+      const writes = parts.length === 1 ? explicit.writes : detectShellWrites(simple).writes;
+      const target = writes.find((write) => write.via.startsWith('redirection '))?.target;
+      if (target) {
+        summaries.push({ label: `Write ${target} (${prog})`, kind: 'write' });
+        continue;
+      }
     }
     // Package managers
     if (/^(npm|pnpm|yarn|bun)$/.test(lower)) {
@@ -183,13 +178,16 @@ export function describeCommand(command: string): CommandInfo {
     }
     summaries.push({ label: `Run ${prog}`, kind: 'run' });
   }
-  if (heredoc && writeTargets.length) writeReasons.push('here-document written to a file');
   // Explicit content writes, including those inside powershell -Command / bash -c wrappers.
-  const explicit = detectShellWrites(text);
   for (const w of explicit.writes) {
     if (w.target) writeTargets.push(w.target);
-    writeReasons.push(w.target ? `${w.via} writes ${w.target}` : `${w.via} writes files`);
+    if (w.target && w.via.startsWith('redirection ')) {
+      writeReasons.push(`redirects output to ${w.target}`);
+    } else {
+      writeReasons.push(w.target ? `${w.via} writes ${w.target}` : `${w.via} writes files`);
+    }
   }
+  if (heredoc && explicit.writes.some((w) => w.via.startsWith('redirection '))) writeReasons.push('here-document written to a file');
   const first = summaries.find((s) => s.kind !== 'read') ?? summaries[0];
   const kind: CommandInfo['kind'] = first?.kind ?? 'run';
   const label = first?.label ?? 'Run command';

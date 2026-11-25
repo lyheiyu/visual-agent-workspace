@@ -124,7 +124,7 @@
     if (c) {
       const statusText =
         c.status === 'streaming'
-          ? S('r.streaming')
+          ? S('r.streaming') + (c.progress ? ' ' + c.progress : '')
           : c.status === 'done'
             ? c.cached
               ? S('r.doneCached')
@@ -156,7 +156,7 @@
       app.appendChild(
         el('section', { class: 'result' }, [
           el('h3', { text: c.title }),
-          el('div', { class: 'small muted', text: `${c.model} · ${statusText}${c.truncated ? ' · ' + S('r.truncated') : ''}${tr && tr.status === 'streaming' ? ' · ' + S('r.translating') : ''}` }),
+          el('div', { class: 'small muted', text: `${c.model} · ${statusText}${c.truncated ? ' · ' + S('r.truncated') : ''}${c.incomplete ? ' · ⚠ ' + S('r.incomplete') : ''}${tr && tr.status === 'streaming' ? ' · ' + S('r.translating') : ''}` }),
           el('div', { class: 'warn small', text: S('r.unverified') }),
           c.error && el('div', { class: 'error small', text: c.error }),
           tr && tr.codeSpansPreserved === false && el('div', { class: 'warn small', text: S('r.codeChanged') }),

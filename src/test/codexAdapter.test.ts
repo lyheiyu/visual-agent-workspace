@@ -51,6 +51,26 @@ function waitFor(controller: AgentController, predicate: (s: ControllerSnapshot)
 
 const tick = (ms = 5) => new Promise((r) => setTimeout(r, ms));
 
+/** Codex sessions are multi-turn: wait until the turn ended (or the task did), then end the session. */
+async function settle(controller: AgentController): Promise<void> {
+  const s = await waitFor(controller, (x) => x.awaitingInput || x.taskStatus !== 'Running');
+  if (controller.isActive && s.awaitingInput) await controller.endSession();
+  await controller.whenIdle();
+}
+
+test('Codex steering delivers image input alongside attached text', async () => {
+  const { server, controller, adapter } = setup('observe', async () => {});
+  controller.start('Wait', adapter);
+  const deadline = Date.now() + 3000;
+  while (!server.received.some((m) => m.method === 'turn/start') && Date.now() < deadline) await tick();
+  await tick();
+  await controller.steer('Look', [{ name: 'screen.png', mime: 'image/png', data: 'aW1hZ2U=' }]);
+  const input = server.received.find((m) => m.method === 'turn/steer')!.params.input;
+  assert.equal(input[1].type, 'image');
+  assert.equal(input[1].url, 'data:image/png;base64,aW1hZ2U=');
+  server.completeTurn('completed'); await settle(controller);
+});
+
 test('observe profile: handshake, isolation-safe thread params, observed-only command', async () => {
   const { server, recorder, controller, adapter } = setup('observe', async (s) => {
     s.itemStarted(commandItem(ROOT));
@@ -60,13 +80,13 @@ test('observe profile: handshake, isolation-safe thread params, observed-only co
     s.completeTurn('completed');
   });
   const taskId = controller.start('Explain validate_samples()', adapter);
-  await controller.whenIdle();
+  await settle(controller);
 
   assert.deepEqual(server.sentMethods(), ['initialize', 'initialized', 'model/list', 'thread/start', 'turn/start']);
   const threadStart = server.received.find((m) => m.method === 'thread/start')!.params;
   assert.equal(threadStart.sandbox, 'read-only');
   assert.equal(threadStart.approvalPolicy, 'on-request');
-  assert.equal(threadStart.ephemeral, true);
+  assert.equal(threadStart.ephemeral, false, 'stored by Codex so the conversation can resume this thread');
   assert.equal(threadStart.cwd, ROOT);
   assert.equal(server.received.find((m) => m.method === 'turn/start')!.params.input[0].text, 'Explain validate_samples()');
 
@@ -92,7 +112,7 @@ test('boundary check: aborts before any turn if Codex does not confirm read-only
   const { server, recorder, controller, adapter } = setup('observe');
   server.threadStartOverride = { sandbox: { type: 'workspaceWrite' } };
   const taskId = controller.start('x', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   assert.ok(!server.sentMethods().includes('turn/start'));
   assert.equal(recorder.getTask(taskId)!.status, 'Failed');
   assert.match(recorder.getTask(taskId)!.summary!, /did not confirm the requested boundary/);
@@ -123,7 +143,7 @@ test('approve-commands: approval is intercepted; accept and decline are sent to 
   assert.equal(second.description, 'Run: rm -rf build');
   assert.match(second.history.map((h) => h.note).join(' '), /cleanup/);
   assert.ok(controller.reject(second.operationId, 'not needed'));
-  await controller.whenIdle();
+  await settle(controller);
 
   assert.deepEqual(replies, [{ decision: 'accept' }, { decision: 'decline' }]);
   const ops = recorder.getOperations(taskId);
@@ -144,7 +164,7 @@ test('read-only profiles decline file changes automatically, but the diff is sti
     s.completeTurn('completed');
   });
   const taskId = controller.start('t', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   assert.deepEqual(reply, { decision: 'decline' });
   const edit = recorder.getOperations(taskId).find((o) => o.operationType === 'Edit')!;
   assert.equal(edit.status, 'Rejected');
@@ -179,7 +199,7 @@ test('approve-edits: patches outside the workspace or in .git are declined; insi
   const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
   assert.equal(recorder.getOperation(snap.awaitingApprovalFor!)!.externalId, 'p-in');
   controller.approve(snap.awaitingApprovalFor!);
-  await controller.whenIdle();
+  await settle(controller);
   assert.deepEqual(replies, [{ decision: 'decline' }, { decision: 'decline' }, { decision: 'decline' }, { decision: 'accept' }]);
   const approved = recorder.getOperation(snap.awaitingApprovalFor!)!;
   assert.equal(approved.status, 'Completed');
@@ -197,7 +217,7 @@ test('observe profile declines command escalations and permission requests autom
     s.completeTurn('completed');
   });
   const taskId = controller.start('t', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   assert.deepEqual(replies, [{ decision: 'decline' }, { permissions: {}, scope: 'turn' }, { answers: {} }]);
   assert.equal(controller.getSnapshot().pendingApprovals.length, 0, 'user was never asked');
   assert.ok(recorder.getOperations(taskId).filter((o) => o.status === 'Rejected').length >= 3);
@@ -213,7 +233,7 @@ test('Stop sends turn/interrupt and answers a pending approval with "cancel"', a
   const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
   assert.equal(controller.pause(), false, 'Codex has no pause; it is not offered');
   assert.ok(controller.stop());
-  await controller.whenIdle();
+  await settle(controller);
   assert.deepEqual(reply, { decision: 'cancel' });
   const interrupt = server.received.find((m) => m.method === 'turn/interrupt');
   assert.deepEqual(interrupt?.params, { threadId: 'thr-1', turnId: 'turn-1' });
@@ -246,7 +266,7 @@ test('steer: delivered with expectedTurnId and recorded; failures are recorded t
   await assert.rejects(controller.steer('   '), /empty/);
   await assert.rejects(controller.steer('x'.repeat(5000)), /limited/);
   release();
-  await controller.whenIdle();
+  await settle(controller);
   const instructs = recorder.getOperations(taskId).filter((o) => o.operationType === 'Instruct');
   assert.deepEqual(instructs.map((o) => o.status), ['Completed', 'Failed']);
   await assert.rejects(controller.steer('late'), /No running task/);
@@ -259,7 +279,7 @@ test('app-server crash mid-turn fails the task and closes open operations', asyn
     s.crash('exit code 3');
   });
   const taskId = controller.start('t', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   const task = recorder.getTask(taskId)!;
   assert.equal(task.status, 'Failed');
   assert.match(task.summary!, /exited unexpectedly/);
@@ -269,12 +289,12 @@ test('app-server crash mid-turn fails the task and closes open operations', asyn
 test('mock demo still works after Codex tasks (adapter is per task)', async () => {
   const { recorder, controller, adapter } = setup('observe');
   controller.start('codex', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   const demo = controller.start('demo', new MockAgentAdapter(undefined, { durationScale: 0 }));
   assert.equal(controller.getSnapshot().capabilities.pause, true);
   const s = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
   controller.approve(s.awaitingApprovalFor!);
-  await controller.whenIdle();
+  await settle(controller);
   assert.equal(recorder.getTask(demo)!.status, 'Completed');
   assert.ok(recorder.getOperations(demo).every((o) => o.enforcement === 'controller'));
 });
@@ -291,7 +311,7 @@ test('declined Codex proposals: the reason / feedback reaches Codex via turn/ste
   const taskId = controller.start('t', adapter);
   const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
   controller.reject(snap.awaitingApprovalFor!, 'Regenerate requested by the user. Feedback: keep the public signature.');
-  await controller.whenIdle();
+  await settle(controller);
   assert.deepEqual(replies, [{ decision: 'decline' }], 'the approval reply itself has no message field');
   const steer = server.received.find((m) => m.method === 'turn/steer')!;
   assert.ok(steer, 'reason sent as a steer');
@@ -314,7 +334,7 @@ test('declined Codex proposal after the turn ended: recorded as NOT delivered (n
   const taskId = controller.start('t', adapter);
   const snap = await waitFor(controller, (x) => !!x.awaitingApprovalFor);
   controller.reject(snap.awaitingApprovalFor!, 'not needed');
-  await controller.whenIdle();
+  await settle(controller);
   await tick(20);
   const op = recorder.getOperations(taskId).find((o) => o.operationType === 'Instruct' && /decline reason/.test(o.description));
   assert.ok(op, 'delivery attempt is visible');
@@ -358,7 +378,7 @@ test('shell source writes: the Add-Content case is blocked before the user is as
     assert.match(op.history.map((h) => h.note).join(' '), /may create or change files[\s\S]*No diff is available before it runs/, command);
     assert.ok(controller.approve(op.operationId));
   }
-  await controller.whenIdle();
+  await settle(controller);
 
   assert.deepEqual(replies, [
     { step: 'write', result: { decision: 'decline' } },
@@ -387,6 +407,6 @@ test('shell source writes: the Add-Content case is blocked before the user is as
 test('read-only Codex profiles get no edit instructions (they decline edits anyway)', async () => {
   const { server, controller, adapter } = setup('observe', async (s) => s.completeTurn('completed'));
   controller.start('x', adapter);
-  await controller.whenIdle();
+  await settle(controller);
   assert.equal(server.received.find((m) => m.method === 'thread/start')!.params.developerInstructions, undefined);
 });

@@ -297,6 +297,36 @@
         "command": "visualAgent.continueFromMyChanges",
         "title": "%cmd.continueFromMyChanges%",
         "category": "Visual Agent"
+      },
+      {
+        "command": "visualAgent.opencode.restart",
+        "title": "%cmd.opencodeRestart%",
+        "category": "Visual Agent",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "visualAgent.opencode.stop",
+        "title": "%cmd.opencodeStop%",
+        "category": "Visual Agent",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "visualAgent.opencode.start",
+        "title": "%cmd.opencodeStart%",
+        "category": "Visual Agent",
+        "icon": "$(play)"
+      },
+      {
+        "command": "visualAgent.opencode.showLog",
+        "title": "%cmd.opencodeShowLog%",
+        "category": "Visual Agent",
+        "icon": "$(output)"
+      },
+      {
+        "command": "visualAgent.opencode.menu",
+        "title": "%cmd.opencodeMenu%",
+        "category": "Visual Agent",
+        "icon": "$(server-process)"
       }
     ],
     "menus": {
@@ -745,6 +775,25 @@
           "minimum": 1024,
           "maximum": 65536,
           "description": "%config.local.outputLimit%"
+        },
+        "visualAgent.local.server.autoStart": {
+          "type": "string",
+          "enum": [
+            "onDemand",
+            "onActivation"
+          ],
+          "default": "onDemand",
+          "enumDescriptions": [
+            "%config.local.server.autoStart.onDemand%",
+            "%config.local.server.autoStart.onActivation%"
+          ],
+          "description": "%config.local.server.autoStart%"
+        },
+        "visualAgent.local.server.idleStopMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "description": "%config.local.server.idleStopMinutes%"
         }
       }
     }
@@ -766,18 +815,19 @@
     "test:claude-subscription": "npm run compile && node scripts/run-claude-subscription-real.js",
     "vscode:prepublish": "npm run compile",
     "package:vsix": "node scripts/package-vsix.js",
-    "verify:vsix": "node scripts/verify-vsix.js"
+    "verify:vsix": "node scripts/verify-vsix.js",
+    "test:opencode-server": "npm run compile && node scripts/run-opencode-server-real.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "~1.85.0",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "4.1.1",
-    "opencode-ai": "1.19.6",
-    "typescript": "^5.4.0"
+    "opencode-ai": "1.19.6"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.326"
+    "@anthropic-ai/claude-agent-sdk": "0.3.326",
+    "typescript": "^5.4.0"
   },
   "overrides": {
     "@vscode/vsce": {

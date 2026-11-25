@@ -218,9 +218,9 @@ export class EventRecorder {
     turn.report = this.clean([
       `第 ${turn.number} 轮 / Turn ${turn.number} · ${status === 'Completed' && failures.length ? '本轮结束，有失败操作 / Finished with failed operations' : status}`,
       ...(error ? [`错误 / Error: ${error}`] : []),
-      edits.length ? '文件修改 / File edits:\n' + edits.map((op) => `- ${op.filePath ?? op.description}: ${op.status}${op.simulated ? ' [SIMULATED]' : ''}`).join('\n') : '本轮没有记录到文件修改 / No recorded file edits.',
-      commands.length ? '命令和测试 / Commands and tests:\n' + commands.map((op) => `- ${op.command!.command}: ${op.status}, exit ${op.command!.exitCode ?? 'unknown'}${op.simulated ? ' [SIMULATED]' : ''}`).join('\n') : '本轮未执行命令或测试 / No recorded commands or tests.',
-      ...(failures.length ? ['失败详情 / Failure details:\n' + failures.slice(0, 10).map((op) => `- ${op.description}: ${(op.resultSummary ?? '').slice(0, 1500)}`).join('\n')] : []),
+      edits.length ? '文件修改 / File edits:\n' + collapseRepeats(edits.map((op) => `- ${(op.associatedChangeIds?.length ?? 0) > 1 ? op.description : op.filePath ?? op.description}: ${op.status}${op.simulated ? ' [SIMULATED]' : ''}`)).join('\n') : '本轮没有记录到文件修改 / No recorded file edits.',
+      commands.length ? '命令和测试 / Commands and tests:\n' + collapseRepeats(commands.map((op) => `- ${op.command!.command}: ${op.status}, exit ${op.command!.exitCode ?? 'unknown'}${op.simulated ? ' [SIMULATED]' : ''}`)).join('\n') : '本轮未执行命令或测试 / No recorded commands or tests.',
+      ...(failures.length ? ['失败详情 / Failure details:\n' + collapseRepeats(failures.map((op) => `- ${op.description}: ${(op.resultSummary ?? '').slice(0, 1500)}`)).slice(0, 10).join('\n')] : []),
       `失败 ${ops.filter((op) => op.status === 'Failed').length} · 拒绝 ${ops.filter((op) => op.status === 'Rejected').length} · 取消 ${ops.filter((op) => op.status === 'Cancelled').length}`,
       '结果来自工具记录；不代表未记录的工作已完成。 / Results reflect recorded tools only.',
     ].join('\n\n'));
@@ -538,4 +538,11 @@ export class MemoryHistoryStorage implements HistoryStorage {
   save(history: PersistedHistory): void {
     this.data = structuredClone(history);
   }
+}
+
+/** Identical report lines once, with a count (e.g. six identical failed edit retries become one line with "(×6)"). Order of first appearance. */
+export function collapseRepeats(lines: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const l of lines) counts.set(l, (counts.get(l) ?? 0) + 1);
+  return [...counts].map(([l, n]) => (n > 1 ? `${l} (×${n})` : l));
 }

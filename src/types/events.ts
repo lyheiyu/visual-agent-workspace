@@ -122,8 +122,21 @@ export interface TaskRecord {
   summary?: string;
   messages?: Array<{ role: 'user' | 'assistant'; text: string; timestamp: string }>;
   launch?: { provider: 'codex' | 'local' | 'claude-code'; model: string; effort?: string; profile: string; workspaceRoot: string; claudeAuthKind?: 'subscription' | 'api-key' | 'cloud' };
-  session?: { provider: 'local'; id: string };
+  /**
+   * Native agent session of this conversation (Codex thread, Claude Code session, OpenCode session).
+   * Only resumed for the same provider; `continuity` says how the latest turn continued.
+   */
+  session?: NativeSession;
   turns?: ConversationTurn[];
+}
+
+export interface NativeSession {
+  provider: 'local' | 'codex' | 'claude-code';
+  id: string;
+  /** new = first session; native = same live session; resumed = restored from the provider; reconstructed = native session unavailable, a new one got a summary. */
+  continuity?: 'new' | 'native' | 'resumed' | 'reconstructed';
+  /** Why native continuation was not possible (reconstructed only). */
+  recoveryReason?: string;
 }
 
 export interface ConversationTurn {

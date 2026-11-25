@@ -4,6 +4,27 @@ import { describeShellWrites, detectShellWrites, shellWriteBlockMessage } from '
 import { describeCommand } from '../analysis/commandInfo';
 import { CODEX_ADD_CONTENT_CASE } from './support/shellFixtures';
 
+test('command #83 does not report the arrow in the recorded Node script as a redirection', () => {
+  const command = "\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command \"node -e 'const {DatabaseSync}=require(''node:sqlite''); const db=new DatabaseSync(process.argv[1],{readOnly:true}); const row=db.prepare(''SELECT value FROM ItemTable WHERE key = ?'').get(''visual-agent-workspace.visual-agent-workspace'');const h=JSON.parse(row.value)[''visualAgent.history.v1'']; const ops=Array.isArray(h.operations)?h.operations:Object.values(h.operations??{}); for(const o of ops.filter(o=>o.sequenceNumber===48)) console.log(JSON.stringify({type:o.operationType,status:o.status,operationId:o.operationId,filePath:o.filePath,ids:o.associatedChangeIds??[o.associatedChangeId], ranges:o.changedRanges})); console.log(Object.keys(h),ops.length);' \\\"\"'$env:APPDATA'\"\\\\Code\\\\User\\\\workspaceStorage\\\\285d1bddf60f0da88d10d12c393318ca\\\\state.vscdb\\\"\"";
+  const info = describeCommand(command);
+  assert.equal(info.writes, false);
+  assert.equal(info.sourceWrite, false);
+  assert.deepEqual(info.writeTargets, []);
+  assert.deepEqual(info.writeReasons, []);
+});
+
+test('redirects after quoted inline comparisons still name the actual output file', () => {
+  const command = "node -e 'console.log([1, 2].filter(x => x > 1 && x >= 2 && x <= 3))'";
+  assert.equal(describeCommand(command).writes, false);
+  const redirected = describeCommand(command + ' 2>> "test output.log"');
+  assert.equal(redirected.writes, true);
+  assert.equal(redirected.sourceWrite, true);
+  assert.deepEqual(redirected.writeTargets, ['test output.log']);
+  assert.deepEqual(redirected.writeReasons, ['redirects output to test output.log']);
+  assert.equal(describeCommand(command + ' 2>&1').writes, false);
+  assert.equal(describeCommand('echo "a > b"').writes, false);
+});
+
 test('shell writes: the supplied Codex PowerShell Add-Content case is detected, with its target resolved', () => {
   const f = detectShellWrites(CODEX_ADD_CONTENT_CASE);
   assert.equal(f.blocked, true);

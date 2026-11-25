@@ -17,13 +17,14 @@ import { ReviewerController } from './reviewer/ReviewerController';
 import { ReviewerViewProvider } from './reviewer/ReviewerViewProvider';
 import { ExportController } from './export/ExportController';
 import { AgentLauncher } from './agents/AgentLauncher';
+import { OpenCodeServerStatus } from './agents/opencode/OpenCodeServerStatus';
+import { SessionContextTracker } from './agents/sessionContext';
 import { NewTaskPanel } from './agents/NewTaskPanel';
 import { ProviderId } from './agents/providers';
 import { continuationContext } from './recorder/conversation';
 import { ConversationPanel } from './ui/ConversationPanel';
 import * as path from 'node:path';
 import { isInside } from './navigation/pathSafety';
-import { findEnclosingFunction } from './navigation/symbolSearch';
 import { selectProjectRoot, PROJECT_TRANSFER_KEY, ProjectTransfer } from './navigation/ProjectWorkspace';
 import { ReferenceNavigator } from './references/ReferenceNavigator';
 import { ExplainController } from './reviewer/ExplainController';
@@ -54,6 +55,7 @@ export interface VisualAgentApi {
   launcher: AgentLauncher;
   explainer: ExplainController;
   manual: ManualChanges;
+  sessions: SessionContextTracker;
 }
 
 export function activate(context: vscode.ExtensionContext): VisualAgentApi {
@@ -179,6 +181,24 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
 
   // ---- v0.4: unified provider/model selection (Codex, Claude Code, local agent)
   const launcher = new AgentLauncher(context, controller, navigator, log, recorder, () => reviewer.getState().busy);
+  // Per-conversation context record: files the agent saw (fingerprints only), continuity and usage counters.
+  const sessions = new SessionContextTracker(recorder, { storeFile: path.join((context.storageUri ?? context.globalStorageUri).fsPath, 'session-context.json'), log: (l) => log.appendLine(l) });
+  launcher.sessions = sessions;
+  const sessionSub = controller.onDidSessionEvent((e) => {
+    if (e.kind === 'session') sessions.noteSession(e.taskId, e.session);
+    else if (e.kind === 'usage') sessions.noteUsage(e.taskId, e.usage);
+    else sessions.noteNativeTurn(e.taskId);
+  });
+  context.subscriptions.push({ dispose: () => { sessionSub.dispose(); sessions.dispose(); } });
+  // Local OpenCode server: status bar, Restart/Stop/Show log; stopped on deactivation only if this window started it.
+  const serverStatus = new OpenCodeServerStatus(launcher.opencode, log, () => launcher.startLocalServer(), () => !!launcher.lastSelection().byProvider.local);
+  context.subscriptions.push(serverStatus, { dispose: () => launcher.opencode.dispose() });
+  if (vscode.workspace.getConfiguration('visualAgent').get<string>('local.server.autoStart', 'onDemand') === 'onActivation') {
+    void launcher.startLocalServer().then(
+      (why) => why && log.appendLine(`[opencode] not started on activation: ${why}`),
+      (err) => log.appendLine(`[opencode] start on activation failed: ${(err as Error).message}`),
+    );
+  }
   // "Check my changes" / "Continue from my changes": same conversation, same coding model.
   const manual = new ManualChanges(
     recorder,
@@ -211,6 +231,11 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
     const restore = setTimeout(() => {
       if (transfer.selection) NewTaskPanel.show(context.extensionUri, launcher, () => controls.language(), () => reviewer.getState().selectedModel, transfer.selection.provider, transfer.selection);
       else void vscode.commands.executeCommand('visualAgent.openConversations', transfer.taskId);
+      if (transfer.revealObserver) {
+        void vscode.commands.executeCommand('workbench.view.explorer')
+          .then(() => vscode.commands.executeCommand('visualAgent.showActivityBeside'))
+          .then(undefined, (err) => log.appendLine(`[activity] restore failed: ${err}`));
+      }
     }, 150);
     context.subscriptions.push({ dispose: () => clearTimeout(restore) });
   }
@@ -226,17 +251,15 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
     vscode.commands.registerCommand('visualAgent.openConversations', (taskId?: string) => {
       return ConversationPanel.show(context.extensionUri, recorder, controller, launcher, controls, references, manual, taskId ?? controls.getSelection().taskId);
     }),
-    vscode.commands.registerCommand('visualAgent.explainInConversation', async (taskId?: string) => {
+    vscode.commands.registerCommand('visualAgent.explainInConversation', async (taskId?: string, impact = false) => {
       const task = taskId ? recorder.getTask(taskId) : undefined;
       const root = task?.workspaceRoot ?? task?.launch?.workspaceRoot;
-      if (!task || !root || !sourceEditor || !isInside(root, sourceEditor.document.uri.fsPath)) {
-        throw new Error('请先打开此会话项目中的源文件，并把光标放在要解释的函数中。 / Open a source file from this conversation project first.');
+      const editor = [sourceEditor, ...vscode.window.visibleTextEditors].find((candidate) =>
+        candidate && root && candidate.document.uri.scheme === 'file' && !candidate.document.isClosed && isInside(root, candidate.document.uri.fsPath));
+      if (!task || !editor) {
+        throw new Error('请先打开此会话项目中的源文件。 / Open a source file from this conversation project first.');
       }
-      if (sourceEditor.document.isClosed || sourceEditor.document.isDirty) throw new Error('请先打开并保存源文件，再让代理读取和解释。 / Open and save the source file first so the agent reads the same code you see.');
-      const file = path.relative(root, sourceEditor.document.uri.fsPath).replace(/\\/g, '/');
-      const line = sourceEditor.selection.active.line;
-      const fn = findEnclosingFunction(sourceEditor.document.getText(), line, sourceEditor.document.languageId);
-      await launcher.send(task.taskId, `请读取 ${JSON.stringify(file)}，解释${fn ? `函数 ${fn}()` : `第 ${line + 1} 行附近的代码`}。用中文说明作用、输入输出、主要流程和潜在问题。本轮仅解释，不要修改文件或运行命令。`);
+      return impact ? reviewerController.impactAnalysis(editor, task.taskId) : reviewerController.explainFunction(editor, task.taskId);
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       if (!controller.isActive) {
@@ -284,6 +307,7 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ActivityViewProvider.viewId, activityView),
+    vscode.commands.registerCommand('visualAgent.showActivityBeside', () => activityView.showBeside()),
     vscode.window.createTreeView('visualAgent.commands', { treeDataProvider: commandTree }),
     activityView,
     vscode.window.registerWebviewViewProvider(ReviewerViewProvider.viewId, reviewerView),
@@ -303,7 +327,7 @@ export function activate(context: vscode.ExtensionContext): VisualAgentApi {
   );
 
   log.appendLine('Visual Agent Workspace activated (adapters: mock demo, Codex App Server)');
-  return { controller, recorder, startCodex, reviewer, reviewerController, exporter, controls, launcher, explainer, manual };
+  return { controller, recorder, startCodex, reviewer, reviewerController, exporter, controls, launcher, explainer, manual, sessions };
 }
 
 export function deactivate(): void {}

@@ -9,6 +9,7 @@ export interface ProjectTransfer {
   history: PersistedHistory;
   taskId?: string;
   selection?: Partial<TaskSelection>;
+  revealObserver?: boolean;
 }
 
 let selectedProject: string | undefined;
@@ -47,6 +48,7 @@ export async function showProjectFolder(root: string, reveal = true, transition?
   if (reveal) {
     await vscode.commands.executeCommand('workbench.view.explorer');
     await vscode.commands.executeCommand('revealInExplorer', uri);
+    await vscode.commands.executeCommand('visualAgent.showActivityBeside');
   }
   return true;
 }

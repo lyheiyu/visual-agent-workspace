@@ -4,6 +4,8 @@ import * as net from 'node:net';
 import { OllamaClient, OllamaError, thinkParam, validateEndpoint } from '../reviewer/OllamaClient';
 import { ReviewService, ReviewServiceOptions, ReviewRequest } from '../reviewer/ReviewService';
 import { FakeOllama } from './support/fakeOllama';
+import { extractChangeContext } from '../reviewer/changeContext';
+import { reviewChangePrompt, reviewChangesPrompt } from '../reviewer/prompts';
 
 function service(endpoint: string, overrides: Partial<ReviewServiceOptions> = {}) {
   return new ReviewService({
@@ -207,4 +209,108 @@ test('disabled reviewer makes no HTTP requests at all', async () => {
   assert.equal(s.getState().connection, 'disabled');
   await assert.rejects(s.run(request()), /disabled/);
   assert.deepEqual(calls, []);
+});
+
+test('change review caches formatted results and refreshes when omitted snapshot context changes', async () => {
+  const fake = new FakeOllama();
+  const url = await fake.start();
+  try {
+    const s = service(url);
+    const makeRequest = (comment: string): ReviewRequest => {
+      const prefix = `// ${comment}\n`;
+      const filePath = 'a.ts';
+      const context = extractChangeContext(filePath, prefix + 'function f() { return 0; }', prefix + 'function f() { return 1; }');
+      return { kind: 'review', title: 'Review f()', subject: { filePath }, ...reviewChangePrompt({ filePath, ...context }, 1000) };
+    };
+    fake.tokens = ['[]'];
+    const first = makeRequest('first');
+    const second = makeRequest('second');
+    assert.deepEqual(first.messages, second.messages);
+    assert.equal((await s.run(first)).text, 'No issues found.');
+    assert.equal((await s.run(first)).cached, true);
+    assert.equal((await s.run(second)).cached, false);
+    fake.tokens = ['invalid output'];
+    assert.match((await s.run({ ...second, noCache: true })).text, /Insufficient context/);
+    assert.equal((await s.run(second)).text, 'No issues found.');
+    assert.equal(s.inferenceRequests, 3);
+  } finally {
+    await fake.stop();
+  }
+});
+
+test('one review request explains two files and filters reversed evidence and repeated findings', async () => {
+  const fake = new FakeOllama();
+  const url = await fake.start();
+  try {
+    const s = service(url);
+    const files = [
+      { filePath: 'a.ts', ...extractChangeContext('a.ts', 'const retries = 1;', 'const retries = 3;') },
+      { filePath: 'b.ts', ...extractChangeContext('b.ts', 'const enabled = false;', 'const enabled = true;') },
+    ];
+    const built = reviewChangesPrompt(files, 'recorded edit', 500);
+    assert.ok(built.context.length <= 500);
+    const evidence = { side: 'after', line: 1 };
+    const reversed = { ...evidence, file: 2, status: 'confirmed', quote: 'enabled = false', message: 'Reversed result.' };
+    fake.tokens = [JSON.stringify([
+      { ...evidence, file: 1, status: 'change', quote: 'retries = 3', message: 'Raises the retry limit.' },
+      { ...evidence, file: 2, status: 'change', quote: 'enabled = true', message: 'Enables the option.' },
+      ...Array(5).fill(reversed),
+      ...['Retries may increase load.', 'A higher limit may increase load.'].map((message) => ({
+        ...evidence, file: 1, status: 'risk', quote: 'retries = 3', message,
+      })),
+    ])];
+    const result = await s.run({ kind: 'review', title: 'Review edit', subject: {}, ...built });
+    assert.equal(fake.chatRequests.length, 1);
+    assert.match(result.text, /a\.ts:1.*Raises the retry limit/);
+    assert.match(result.text, /b\.ts:1.*Enables the option/);
+    assert.equal(result.text.match(/Potential risk/g)?.length, 1);
+    assert.doesNotMatch(result.text, /Reversed result/);
+  } finally {
+    await fake.stop();
+  }
+});
+
+test('operation #48 reports missing context when only the persisted edit record is available', async () => {
+  const fake = new FakeOllama();
+  const url = await fake.start();
+  try {
+    const filePath = 'src/review/ChangeReviewManager.ts';
+    const built = reviewChangesPrompt([
+      { filePath, ...extractChangeContext(filePath, '', '', false) },
+    ], 'operation #48 (Cancelled)', 1000);
+    const reversed = { status: 'confirmed', side: 'after', line: 163, quote: 'replacementText', message: 'Unverified claim.' };
+    fake.tokens = [JSON.stringify(Array(5).fill(reversed))];
+    const result = await service(url).run({ kind: 'review', title: 'Review #48', subject: { filePath }, ...built });
+    assert.match(result.text, /Insufficient context.*ChangeReviewManager\.ts/);
+    assert.doesNotMatch(result.text, /Unverified claim|No issues found/);
+  } finally {
+    await fake.stop();
+  }
+});
+
+test('Explain Diff requires supported explanations and caches them separately from review', async () => {
+  const fake = new FakeOllama();
+  const url = await fake.start();
+  try {
+    const s = service(url);
+    const filePath = 'retries.ts';
+    const files = [{ filePath, ...extractChangeContext(filePath, 'const retries = 1;', 'const retries = 3;') }];
+    const request = (explainOnly: boolean): ReviewRequest => ({
+      kind: 'review', title: 'Retries change', subject: { filePath },
+      ...reviewChangesPrompt(files, 'Recorded intent: allow transient failures', 500, 'en', explainOnly),
+    });
+    fake.tokens = ['[]'];
+    assert.match((await s.run(request(true))).text, /Insufficient context/);
+    const change = { file: 1, status: 'change', side: 'after', line: 1, quote: 'retries = 3', message: 'Raises retries from one to three, likely to tolerate transient failures.' };
+    fake.tokens = [JSON.stringify([change, change])];
+    const explained = await s.run(request(true));
+    assert.match(explained.text, /Raises retries from one to three/);
+    assert.doesNotMatch(explained.text, /No issues found/);
+    assert.equal(explained.text.match(/Raises retries/g)?.length, 1);
+    assert.equal((await s.run(request(true))).cached, true);
+    assert.equal((await s.run(request(false))).cached, false);
+    assert.equal(fake.chatRequests.length, 3);
+  } finally {
+    await fake.stop();
+  }
 });

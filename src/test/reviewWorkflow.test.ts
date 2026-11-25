@@ -204,6 +204,7 @@ class Element {
   replaceChildren() { this.children = []; }
   setAttribute(k: string, v: string) { this.attrs[k] = v; }
   getAttribute(k: string) { return this.attrs[k]; }
+  removeAttribute(k: string) { if (k === 'open') this.open = false; delete this.attrs[k]; }
   addEventListener(k: string, fn: (e?: any) => void) { this.listeners[k] = fn; }
   querySelector() { return null; }
 }
@@ -212,16 +213,35 @@ function load(file: string, state: any = {}) {
   const all = (n: any): any[] => [n, ...(n.children ?? []).flatMap(all)];
   let receive: (e: any) => void = () => {};
   const sent: any[] = [];
-  const window: any = { addEventListener: (_: string, fn: any) => { receive = fn; } };
+  const documentListeners: Record<string, (e?: any) => void> = {};
+  const window: any = { addEventListener: (k: string, fn: any) => { if (k === 'message') receive = fn; } };
+  // Webview clock: a new approval card ignores clicks for its first 0.7 s. Delivering a state advances the
+  // clock by 1 s (as if the user read the card) unless raw = true; timers are not needed here.
+  const clock = { t: 1_000_000 };
+  const RealDate = Date;
+  class FakeDate extends RealDate { static now() { return clock.t; } }
   const ctx = vm.createContext({
+    Date: FakeDate,
+    setTimeout: () => 0,
     window,
     acquireVsCodeApi: () => ({ getState: () => state, setState: () => {}, postMessage: (m: any) => sent.push(JSON.parse(JSON.stringify(m))) }),
-    document: { getElementById: (id: string) => all(app).find((e) => e.id === id), createElement: (t: string) => new Element(t), createTextNode: (v: string) => Object.assign(new Element('#text'), { textContent: v }), activeElement: null, scrollingElement: { scrollTop: 0 } },
+    document: {
+      getElementById: (id: string) => all(app).find((e) => e.id === id),
+      createElement: (t: string) => new Element(t),
+      createTextNode: (v: string) => Object.assign(new Element('#text'), { textContent: v }),
+      // activity.js dismisses open "…" menus on outside pointerdown / Escape (document-level listeners).
+      addEventListener: (k: string, fn: (e?: any) => void) => { documentListeners[k] = fn; },
+      querySelector: (sel: string) => (sel === 'details.more[open]' ? all(app).find((e) => e.className === 'more' && e.open) ?? null : null),
+      querySelectorAll: (sel: string) => (sel === 'details.more[open]' ? all(app).filter((e) => e.className === 'more' && e.open) : []),
+      activeElement: null,
+      scrollingElement: { scrollTop: 0 },
+    },
+    Element,
     CSS: { escape: (s: string) => s },
   });
   vm.runInContext(fs.readFileSync(path.join(MEDIA, 'markdownView.js'), 'utf8'), ctx);
   vm.runInContext(fs.readFileSync(path.join(MEDIA, file), 'utf8'), ctx);
-  return { app, all: () => all(app), sent, deliver: (data: any) => receive({ data }) };
+  return { app, all: () => all(app), sent, deliver: (data: any, raw = false) => { receive({ data }); if (!raw) clock.t += 1000; }, tick: (ms: number) => { clock.t += ms; }, documentListeners };
 }
 
 test('conversation: proposal card offers accept/reject/edit/regenerate; conflict blocks approval; live preview is read-only; manual-change buttons', () => {
@@ -236,15 +256,30 @@ test('conversation: proposal card offers accept/reject/edit/regenerate; conflict
   assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'editProposal', operationId: 'op1' });
   btn('a.approve')!.listeners.click();
   assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'approve', operationId: 'op1' });
+  // The decision is on its way: no second decision from this card (double click, approve + regenerate).
+  const sentAfterApprove = ui.sent.length;
+  assert.equal(btn('a.approve')!.disabled, true, 'approve disabled while the decision is on its way');
+  assert.equal(btn('p.regenerate')!.disabled, true);
+  btn('a.approve')!.listeners.click();
+  assert.equal(ui.sent.length, sentAfterApprove, 'a second click sends nothing');
+  // Decided (the card is gone); a later proposal with the same id is decidable again.
+  ui.deliver({ type: 'state', model: { ...base, approvals: [] } });
+  ui.deliver({ type: 'state', model: { ...base, approvals: [approval] } });
   // Feedback for regenerate comes from the composer draft.
   const input = ui.all().find((e) => e.id === 'message')!;
   input.value = 'keep the signature';
   input.listeners.input();
   btn('p.regenerate')!.listeners.click();
   assert.deepEqual(ui.sent.at(-1), { type: 'regenerate', operationId: 'op1', feedback: 'keep the signature' });
-  ui.deliver({ type: 'state', model: { ...base, approvals: [{ ...approval, editing: true, conflict: 'math.js changed on disk since the diff was computed' }] } });
+  ui.deliver({ type: 'state', model: { ...base, approvals: [] } });
+  ui.deliver({ type: 'state', model: { ...base, approvals: [{ ...approval, conflict: 'math.js changed on disk since the diff was computed' }] } });
   assert.equal(btn('a.approve')!.disabled, true, 'approval disabled on conflict');
   assert.ok(ui.all().some((e) => /p\.conflict|math\.js changed/.test(e.textContent)));
+  // While editing your own version: Apply my version / Cancel, not the agent's Approve or Review diff.
+  ui.deliver({ type: 'state', model: { ...base, approvals: [{ ...approval, editing: true }] } });
+  assert.equal(btn('a.approve'), undefined, 'no Approve while editing (it would discard your version)');
+  assert.equal(btn('a.reviewDiff'), undefined);
+  assert.ok(btn('p.cancelEdit'));
   btn('p.applyMine')!.listeners.click();
   assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'applyEdited', operationId: 'op1' });
   // Command approval: summary + write label, full command collapsed.
@@ -322,8 +357,10 @@ test('activity webview: completed turns collapsed; title toggles brief inline de
   const groups = ui.all().filter((e) => e.className === 'turn-group');
   assert.deepEqual(groups.map((g) => g.open), [false, true], 'completed turn collapsed, running turn open');
   const btn = (label: string) => ui.all().find((e) => e.tagName === 'button' && e.textContent === label);
-  btn('a.reviewChanges')!.listeners.click();
-  assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'review', operationId: 'op3' }, 'pending edit: Review changes opens the diff');
+  // The pending edit is decided in the banner only (no second Review/Approve set on its row).
+  assert.equal(btn('a.reviewChanges'), undefined, 'no duplicate review button on the pending row');
+  btn('a.reviewDiff')!.listeners.click();
+  assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'review', operationId: 'op3' }, 'pending edit: Review diff opens the diff');
   btn('a.viewFile')!.listeners.click();
   assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'reveal', operationId: 'op2' }, 'View file opens the editor');
   assert.ok(ui.all().some((e) => e.className === 'op-error' && e.textContent === 'exit 1: E   assert 1 == 2'), 'short error reason on the row');
@@ -369,10 +406,20 @@ test('activity webview: completed turns collapsed; title toggles brief inline de
   assert.deepEqual(ui.sent.at(-1), { type: 'copy', operationId: 'op1', what: 'command' });
   deep(menus[0]).find((e: any) => e.textContent === 'a.fullRecord').listeners.click();
   assert.deepEqual(ui.sent.at(-1), { type: 'action', action: 'record', operationId: 'op1' });
-  assert.ok(menuButtons(2).includes('p.editFirst') && menuButtons(2).includes('p.regenerate'));
-  // Clicking the title again collapses (no message, nothing opened).
+  assert.ok(!menuButtons(2).includes('p.editFirst') && !menuButtons(2).includes('p.regenerate'), 'edit/regenerate for the pending edit are in the banner, not repeated in "…"');
+  assert.ok(ui.all().some((e) => e.tagName === 'button' && e.textContent === 'p.editFirst'), 'banner offers Edit before applying');
+  // Escape and an outside pointerdown close open "…" menus (document-level listeners).
+  menus[0].open = true;
+  let prevented = false;
+  ui.documentListeners.keydown({ key: 'Escape', preventDefault: () => { prevented = true; } });
+  assert.equal(menus[0].open, false, 'Escape closes the open menu');
+  assert.equal(prevented, true);
+  menus[1].open = true;
+  ui.documentListeners.pointerdown({ target: {} });
+  assert.equal(menus[1].open, false, 'a click outside closes the open menu');
+  // Clicking the title again collapses: nothing is opened; the extension only learns that nothing is expanded by hand.
   const sentBefore = ui.sent.length;
   titleNode().listeners.click();
-  assert.equal(ui.sent.length, sentBefore);
+  assert.deepEqual(ui.sent.slice(sentBefore), [{ type: 'expand', operationId: null }]);
   assert.equal(ui.all().find((e) => e.className === 'brief'), undefined);
 });

@@ -162,7 +162,8 @@ test('local agent: read-only analysis — observed reads, answer recorded, sessi
   assert.ok(fake.requests.every((r) => !r.route.includes('/prompt_async') || r.route.includes(fake.sessionId)));
   const body = fake.requests.find((r) => r.route.endsWith('/prompt_async'))!.body;
   assert.deepEqual(body.model, { providerID: 'ollama', modelID: 'qwen3:8b' });
-  assert.equal(body.system, localWorkflowPrompt('read-only', 'plan-files', root));
+  assert.ok(body.system.startsWith(localWorkflowPrompt('read-only', 'plan-files', root)));
+  assert.match(body.system, /Original task.*\nExplain divide\(\)/);
   assert.ok(body.system.includes(JSON.stringify(root)), 'actual selected workspace is supplied to the model');
   const prompts = fake.requests.filter((r) => r.route.endsWith('/prompt_async'));
   assert.equal(prompts[1].body.system, body.system, 'follow-up retains workflow without an extra planning request');
@@ -312,6 +313,21 @@ test('local agent: server crash fails the task', async () => {
 });
 
 // ------------------------------------------------------------------ Claude Code adapter (contract)
+
+test('Claude follow-ups deliver native image blocks rather than filenames', async () => {
+  const root = workspace();
+  const q = fakeQuery(async (_opts, push) => { push({ type: 'result', subtype: 'success', is_error: false }); });
+  const adapter = new ClaudeCodeAdapter({ loadQuery: async () => q.fn, model: 'claude-sonnet-5-5', profile: 'read-only', env: { ANTHROPIC_API_KEY: 'test' } });
+  const { controller } = setup(root);
+  controller.start('Hello', adapter);
+  await waitFor(controller, (s) => s.awaitingInput);
+  await controller.steer('Describe', [{ name: 'screen.png', mime: 'image/png', data: 'aW1hZ2U=' }]);
+  await waitFor(controller, (s) => s.awaitingInput);
+  const prompts = q.calls.filter((c) => c.prompt);
+  const blocks = prompts[1].prompt.message.content;
+  assert.deepEqual(blocks[1], { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } });
+  await controller.endSession(); await controller.whenIdle();
+});
 
 /** Fake Agent SDK query(): yields messages shaped like the SDK's SDKMessage union and calls canUseTool like Claude Code does. */
 function fakeQuery(script: (opts: any, push: (m: any) => void) => Promise<void>, account: { apiKeySource?: string; apiProvider?: string; tokenSource?: string; subscriptionType?: string } = { apiKeySource: 'ANTHROPIC_API_KEY', apiProvider: 'firstParty' }): { fn: SdkQueryFn; calls: any[]; interrupted: () => boolean } {
@@ -480,17 +496,19 @@ test('Claude subscription: confirmed before prompting; same-session follow-up; A
 
 test('Ollama coding-model discovery marks models without tool-calling as incompatible', async () => {
   const fakeFetch = (async (url: string, init?: any) => {
+    if (url.endsWith('/api/ps')) return { json: async () => ({ models: [{ name: 'qwen3:8b', context_length: 8192 }] }) };
     if (url.endsWith('/api/tags')) {
       return { json: async () => ({ models: [{ name: 'qwen3:8b', size: 5.2e9, details: { parameter_size: '8.2B' } }, { name: 'llama3:8b', size: 4.7e9, details: {} }, { name: 'nomic-embed', size: 1e8, details: {} }] }) };
     }
     const model = JSON.parse(init.body).model;
     const caps: Record<string, string[]> = { 'qwen3:8b': ['completion', 'tools', 'thinking'], 'llama3:8b': ['completion'], 'nomic-embed': ['embedding'] };
-    return { json: async () => ({ capabilities: caps[model], model_info: { 'qwen3.context_length': 40960 } }) };
+    return { json: async () => ({ capabilities: caps[model], model_info: { 'qwen3.context_length': 40960 }, parameters: model === 'qwen3:8b' ? 'num_ctx 16384' : undefined }) };
   }) as unknown as typeof fetch;
   const ms = await discoverOllamaCodingModels('http://127.0.0.1:11434', fakeFetch);
   assert.deepEqual(ms.map((m) => [m.id, m.compatible]), [['qwen3:8b', true], ['llama3:8b', false], ['nomic-embed', false]]);
   assert.match(ms[1].reason!, /no tool-calling/);
-  assert.equal(ms[0].contextLength, 40960);
+  assert.equal(ms[0].contextLength, 8192, 'use the loaded runner window when it is smaller than the model limits');
+  assert.equal(ms[1].contextLength, 40960, 'use the declared maximum when the runner and model tag do not specify a size');
 });
 
 test('coding model and reviewer model are independent', async () => {

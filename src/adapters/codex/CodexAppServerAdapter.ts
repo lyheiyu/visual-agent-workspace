@@ -1,4 +1,6 @@
+import { PromptAttachment, codexAttachmentInput } from '../../agents/attachments';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   AdapterCapabilities,
   AgentTaskContext,
@@ -20,7 +22,6 @@ import {
   FileChangeApprovalParams,
   RpcNotification,
   SERVER_REQUEST,
-  textInput,
   ThreadStartResponse,
   Turn,
   TurnNotification,
@@ -43,6 +44,12 @@ export interface CodexAdapterOptions {
   model?: string;
   /** Reasoning effort for the turn (one of the model's supportedReasoningEfforts). */
   effort?: string;
+  /** Native thread of this conversation to continue (`thread/resume`); a new thread is started if it cannot be resumed. */
+  resumeThreadId?: string;
+  /** Compact summary used only when the native thread cannot be resumed (marked as reconstructed). */
+  reconstructedContext?: (reason?: string) => string;
+  /** Set when this session starts from a reconstructed summary (the prompt already contains it): recorded as reconstructed. */
+  reconstructedReason?: string;
   /** Hard limit for one turn; the turn is interrupted when exceeded. */
   maxTurnMs?: number;
   clientVersion?: string;
@@ -56,9 +63,10 @@ interface TurnWaiter {
 /**
  * Codex App Server adapter (streaming).
  *
- * - Starts its OWN `codex app-server` process and an ephemeral thread. It
- *   cannot see or control any other Codex session (e.g. the Codex VS Code
- *   extension); those run in separate processes.
+ * - Starts its OWN `codex app-server` process. One thread per conversation:
+ *   follow-ups are new turns in that thread (native context, no replay);
+ *   a later session resumes it with `thread/resume`. It cannot see or
+ *   control any other Codex session (e.g. the Codex VS Code extension).
  * - Every item Codex reports becomes an operation. Items Codex runs without
  *   asking are recorded as observed-only; items Codex asks about block until
  *   the user decides (real interception, enforced by Codex).
@@ -69,7 +77,7 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
   readonly kind = 'streaming' as const;
   readonly id = 'codex';
   readonly simulated = false;
-  readonly capabilities: AdapterCapabilities = { pause: false, interrupt: true, steer: true };
+  readonly capabilities: AdapterCapabilities = { pause: false, interrupt: true, steer: true, followUp: true, steerWhileRunning: true };
   readonly displayName: string;
   readonly boundary: string;
 
@@ -86,6 +94,10 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
   private readonly decidedItems = new Set<string>();
   private mapper: CodexItemMapper | undefined;
   private interrupting = false;
+  private sink: OperationSink | undefined;
+  /** Set while the thread waits for the next message (between turns). */
+  private awaiting: ((m: { text: string; attachments?: PromptAttachment[] } | undefined) => void) | undefined;
+  private endedBy: 'completed' | 'interrupted' | undefined;
 
   constructor(private readonly options: CodexAdapterOptions) {
     this.displayName = `Codex (${options.profile.label})`;
@@ -97,6 +109,7 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
       throw new Error('Codex mode needs an open workspace folder.');
     }
     const profile = this.options.profile;
+    this.sink = sink;
     this.mapper = new CodexItemMapper(ctx.workspaceRoot, this.options.readText ?? readTextSafe);
     this.translator = new CodexEventTranslator(this.mapper);
     this.applier = new NormalizedEventApplier(sink);
@@ -118,22 +131,42 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
       }
 
       const model = this.options.model || (await this.defaultModel(client));
-      const started = await client.request<ThreadStartResponse>('thread/start', {
+      const threadParams = {
         cwd: ctx.workspaceRoot,
         model,
         approvalPolicy: profile.approvalPolicy,
         sandbox: profile.sandbox,
-        ephemeral: true,
-        serviceName: 'visual-agent-workspace',
         // Only profiles that can apply patches get the edit rule; read-only ones decline edits anyway.
         ...(profile.fileChanges === 'ask-user' ? { developerInstructions: SOURCE_EDIT_POLICY } : {}),
-      });
+      };
+      // 1. Continue the conversation's own native thread when there is one.
+      let started: ThreadStartResponse | undefined;
+      let continuity: 'new' | 'resumed' | 'reconstructed' = this.options.reconstructedReason ? 'reconstructed' : 'new';
+      let recoveryReason: string | undefined = this.options.reconstructedReason;
+      let resumeFailed = false;
+      if (this.options.resumeThreadId) {
+        try {
+          const resumed = await client.request<ThreadStartResponse>('thread/resume', { ...threadParams, threadId: this.options.resumeThreadId, excludeTurns: true }, 60_000);
+          const problem = this.incompatible(resumed, ctx.workspaceRoot);
+          if (problem) throw new Error(problem);
+          started = resumed;
+          continuity = 'resumed';
+        } catch (err) {
+          recoveryReason = err instanceof RpcError || err instanceof Error ? err.message : String(err);
+          continuity = 'reconstructed';
+          resumeFailed = true;
+          sink.log(`[codex] thread ${this.options.resumeThreadId} could not be resumed: ${recoveryReason}`);
+        }
+      }
+      // 2. Otherwise (first turn, or the native thread is gone): a new thread. Stored by Codex so it can be resumed later.
+      if (!started) {
+        started = await client.request<ThreadStartResponse>('thread/start', { ...threadParams, ephemeral: false, serviceName: 'visual-agent-workspace' });
+      }
       this.threadId = started.thread.id;
       // No silent substitution: an explicitly selected model must be the one Codex runs.
       if (this.options.model && started.model !== this.options.model) {
         throw new Error(`Codex started model "${started.model}" instead of the selected "${this.options.model}". Aborting before any turn starts.`);
       }
-
       // Safety check: refuse to proceed unless Codex confirms the requested boundary.
       const sandboxType = (started.sandbox as { type?: string } | undefined)?.type;
       if (sandboxType !== 'readOnly' || started.approvalPolicy !== profile.approvalPolicy) {
@@ -141,48 +174,92 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
           `Codex did not confirm the requested boundary (sandbox=${sandboxType ?? 'unknown'}, approvalPolicy=${JSON.stringify(started.approvalPolicy)}). Aborting before any turn starts.`,
         );
       }
+      sink.setSession?.({ provider: 'codex', id: started.thread.id, continuity, ...(recoveryReason ? { recoveryReason } : {}) });
+      const how =
+        continuity === 'resumed'
+          ? 'Codex thread resumed (native context kept)'
+          : continuity === 'reconstructed'
+            ? 'New Codex thread with reconstructed context (the previous thread could not be resumed)'
+            : 'Codex session started';
       const sessionOp = sink.announce({
         operationType: 'Analyze',
-        description: `Codex session started: ${started.model}${this.options.effort ? ` (effort ${this.options.effort})` : ''}, read-only sandbox, approval "${profile.approvalPolicy}"`,
+        description: `${how}: ${started.model}${this.options.effort ? ` (effort ${this.options.effort})` : ''}, read-only sandbox, approval "${profile.approvalPolicy}"`,
         rationale: profile.boundary,
         externalId: started.thread.id,
       });
       sink.complete(sessionOp, {
         outcome: 'Completed',
-        resultSummary: `Thread ${started.thread.id} (ephemeral) in ${started.cwd}. Boundary confirmed by Codex: sandbox=readOnly, approvalPolicy=${profile.approvalPolicy}.`,
+        resultSummary: `Thread ${started.thread.id} in ${started.cwd}. Boundary confirmed by Codex: sandbox=readOnly, approvalPolicy=${profile.approvalPolicy}.${resumeFailed ? ` Native thread ${this.options.resumeThreadId} not resumed: ${recoveryReason}.` : recoveryReason ? ` Reconstructed context: ${recoveryReason}.` : ''}`,
       });
       if (signal.aborted) {
         return { outcome: 'interrupted' };
       }
 
-      const res = await client.request<{ turn: Turn }>('turn/start', {
-        threadId: this.threadId,
-        input: [textInput(ctx.description)],
-        ...(this.options.effort ? { effort: this.options.effort } : {}),
-      });
-      this.turnId = res.turn.id;
-      this.turnActive = true;
-      if (signal.aborted) {
-        void this.interrupt();
+      // 3. Turns: the first message, then each follow-up as a new turn in the same thread.
+      // Only a failed resume adds the summary here; otherwise the launcher already put it into the prompt.
+      let text = resumeFailed && this.options.reconstructedContext ? this.options.reconstructedContext(recoveryReason) + ctx.description : ctx.description;
+      let attachments = ctx.attachments;
+      for (;;) {
+        const res = await client.request<{ turn: Turn }>('turn/start', {
+          threadId: this.threadId,
+          input: codexAttachmentInput(text, attachments),
+          ...(this.options.effort ? { effort: this.options.effort } : {}),
+        });
+        this.turnId = res.turn.id;
+        this.turnActive = true;
+        if (signal.aborted) {
+          void this.interrupt();
+        }
+        const finished = await this.waitForTurn(res.turn.id, closed);
+        this.turnActive = false;
+        if (finished.status === 'interrupted' || signal.aborted) {
+          return { outcome: 'interrupted' };
+        }
+        if (finished.status === 'failed') {
+          return { outcome: 'failed', message: finished.error?.message ?? 'Codex reported a failed turn.' };
+        }
+        // Turn complete: the thread and its context stay open for the next message.
+        const next = await this.nextMessage(closed, sink);
+        if (!next) {
+          return { outcome: this.endedBy ?? 'completed' };
+        }
+        ({ text, attachments } = next);
       }
-
-      const finished = await this.waitForTurn(res.turn.id, closed);
-      this.turnActive = false;
-      if (finished.status === 'interrupted' || signal.aborted) {
-        return { outcome: 'interrupted' };
-      }
-      if (finished.status === 'failed') {
-        return { outcome: 'failed', message: finished.error?.message ?? 'Codex reported a failed turn.' };
-      }
-      return { outcome: 'completed' };
     } finally {
       this.turnActive = false;
+      this.awaiting = undefined;
       await client.close();
       this.client = undefined;
     }
   }
 
+  /** Resumed thread must be the same project and boundary; otherwise it is not reused. */
+  private incompatible(r: ThreadStartResponse, root: string): string | undefined {
+    const same = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+    if (!r?.thread?.id || r.thread.id !== this.options.resumeThreadId) return `Codex returned thread ${r?.thread?.id ?? 'none'} instead of ${this.options.resumeThreadId}`;
+    if (!r.cwd || !same(path.resolve(r.cwd), path.resolve(root))) return `the thread belongs to another project (${r.cwd})`;
+    if (this.options.model && r.model !== this.options.model) return `the thread runs model ${r.model}, not ${this.options.model}`;
+    return undefined;
+  }
+
+  /** Wait (without a turn) for the next follow-up from steer(), or the end of the session. */
+  private nextMessage(closed: Promise<{ detail: string }>, sink: OperationSink): Promise<{ text: string; attachments?: PromptAttachment[] } | undefined> {
+    sink.setAwaitingInput?.(true);
+    return new Promise((resolve) => {
+      this.awaiting = (m) => {
+        this.awaiting = undefined;
+        resolve(m);
+      };
+      void closed.then(() => this.awaiting?.(undefined));
+    });
+  }
+
   async interrupt(): Promise<void> {
+    if (this.awaiting) {
+      this.endedBy = 'interrupted';
+      this.awaiting(undefined);
+      return;
+    }
     const client = this.client;
     if (!client || this.interrupting) {
       return;
@@ -213,7 +290,12 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
     }
   }
 
-  async steer(text: string): Promise<void> {
+  async steer(text: string, attachments?: PromptAttachment[]): Promise<void> {
+    if (this.awaiting && !this.turnActive) {
+      // A follow-up: the next turn of the same thread.
+      this.awaiting({ text, attachments });
+      return;
+    }
     if (!this.client || !this.threadId || !this.turnId || !this.turnActive) {
       throw new Error('Codex has no active turn to send the instruction to.');
     }
@@ -221,9 +303,15 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
     // so it can never be applied to work the user did not see.
     await this.client.request('turn/steer', {
       threadId: this.threadId,
-      input: [textInput(text)],
+      input: codexAttachmentInput(text, attachments),
       expectedTurnId: this.turnId,
     }, 15_000);
+  }
+
+  /** End the conversation's session gracefully (the thread stays stored and can be resumed later). */
+  async endSession(): Promise<void> {
+    this.endedBy = 'completed';
+    this.awaiting?.(undefined);
   }
 
   dispose(): void {
@@ -299,6 +387,12 @@ export class CodexAppServerAdapter implements StreamingAgentAdapter {
         if (!this.turnId) {
           this.turnId = turn.id;
         }
+        return;
+      }
+      case 'thread/tokenUsage/updated': {
+        // Provider-reported usage of the latest turn (diagnostics only).
+        const last = (n.params as { tokenUsage?: { last?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalTokens?: number } } }).tokenUsage?.last;
+        if (last) this.sink?.reportUsage?.({ inputTokens: last.inputTokens, cachedInputTokens: last.cachedInputTokens, outputTokens: last.outputTokens, totalTokens: last.totalTokens });
         return;
       }
       case 'turn/completed': {

@@ -17,6 +17,17 @@ const ROOT = path.resolve(__dirname, '..', '..', 'demo-workspace');
  * the session handshake and the user's own turn, and the local reviewer is
  * never called during observation.
  */
+/** Codex sessions are multi-turn: wait for the turn to end, then end the session. */
+async function settleCodex(controller: AgentController): Promise<void> {
+  await new Promise<void>((r) => {
+    const done = () => controller.getSnapshot().awaitingInput || !controller.isActive;
+    if (done()) return r();
+    const sub = controller.onDidChangeState(() => { if (done()) { sub.dispose(); r(); } });
+  });
+  if (controller.isActive) await controller.endSession();
+  await controller.whenIdle();
+}
+
 test('observation sends no extra requests to the agent and none to Ollama', async () => {
   const ollamaCalls: string[] = [];
   const reviewer = new ReviewService({
@@ -45,7 +56,7 @@ test('observation sends no extra requests to the agent and none to Ollama', asyn
   const recorder = new EventRecorder();
   const controller = new AgentController(new MockAgentAdapter(undefined, { durationScale: 0 }), recorder, { stepDelayMs: () => 0, workspaceRoot: () => ROOT });
   controller.start('task', new CodexAppServerAdapter({ connector: () => new CodexRpcClient(server), profile: getProfile('observe') }));
-  await controller.whenIdle();
+  await settleCodex(controller);
   // Also a full mock demo.
   controller.start('demo', new MockAgentAdapter(undefined, { durationScale: 0 }));
   await new Promise<void>((r) => {
@@ -95,7 +106,7 @@ test('event-processing overhead (measured)', async () => {
   const controller = new AgentController(new MockAgentAdapter(), recorder, { stepDelayMs: () => 0, workspaceRoot: () => ROOT });
   const heapBefore = process.memoryUsage().heapUsed;
   controller.start('perf', new CodexAppServerAdapter({ connector: () => new CodexRpcClient(server), profile: getProfile('observe') }));
-  await controller.whenIdle();
+  await settleCodex(controller);
   const events = N * 3;
   const ms = t1 - t0;
   recorder.flush();

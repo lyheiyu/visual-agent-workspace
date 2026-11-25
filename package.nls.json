@@ -66,5 +66,14 @@
   "cmd.reviewer.explainCommand": "Explain Command (Local AI, not executed)",
   "cmd.explainFile": "Explain This File (Local AI)",
   "cmd.checkMyChanges": "Check My Changes (ask the agent)",
-  "cmd.continueFromMyChanges": "Continue from My Changes"
+  "cmd.continueFromMyChanges": "Continue from My Changes",
+  "cmd.opencodeRestart": "Restart OpenCode Server",
+  "cmd.opencodeStop": "Stop OpenCode Server",
+  "cmd.opencodeStart": "Start OpenCode Server",
+  "cmd.opencodeShowLog": "Show OpenCode Server Log",
+  "cmd.opencodeMenu": "OpenCode Server Status",
+  "config.local.server.autoStart": "When to start the local OpenCode server. It is always reused while healthy and only stopped if this window started it.",
+  "config.local.server.autoStart.onDemand": "When a local-agent task starts (default).",
+  "config.local.server.autoStart.onActivation": "Also when the extension starts, with the last local-agent model and profile (no model request).",
+  "config.local.server.idleStopMinutes": "Stop the OpenCode server this window started after this many minutes without a local-agent session. 0 = keep it running until VS Code closes."
 }

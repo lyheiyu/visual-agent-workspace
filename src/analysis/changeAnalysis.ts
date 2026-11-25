@@ -1,5 +1,6 @@
 import { applyUnifiedDiff, parseHunks } from '../review/unifiedDiff';
-import { FunctionRange, guessLanguage, listFunctionRanges } from '../navigation/symbolSearch';
+import { guessLanguage, innermost, listFunctionRanges } from '../navigation/symbolSearch';
+import { parseScriptSymbols } from '../navigation/scriptSymbols';
 import { AffectedFunction, ChangedRange } from '../types/events';
 
 /**
@@ -27,10 +28,11 @@ export function analyzeFileChange(
   const newText = changeKind === 'delete' ? '' : base === undefined ? undefined : applyUnifiedDiff(base, unifiedDiff);
 
   const functions = new Map<string, AffectedFunction>();
-  const add = (defs: FunctionRange[], lines: number[], side: 'new' | 'old') => {
+  const add = (text: string, lines: number[], side: 'new' | 'old') => {
+    const defs = parseScriptSymbols(filePath, text)?.functions ?? listFunctionRanges(text, lang);
     for (const line of lines) {
-      const fn = innermostDef(defs, line - 1);
-      if (fn && !functions.has(`${fn.name}:${side}`) && !(side === 'old' && functions.has(`${fn.name}:new`))) {
+      const fn = innermost(defs, line - 1);
+      if (fn?.name && !functions.has(`${fn.name}:${side}`) && !(side === 'old' && functions.has(`${fn.name}:new`))) {
         functions.set(`${fn.name}:${side}`, {
           filePath,
           name: fn.name,
@@ -46,11 +48,11 @@ export function analyzeFileChange(
   const newLines = ranges.filter((r) => r.side === 'new').flatMap((r) => span(r.startLine, r.endLine));
   const oldLines = oldChangedLines(unifiedDiff);
   if (newText !== undefined) {
-    add(listFunctionRanges(newText, lang), newLines, 'new');
+    add(newText, newLines, 'new');
   }
   if (originalText !== undefined && changeKind !== 'add') {
     // Functions that were edited or deleted, as located in the original file.
-    add(listFunctionRanges(originalText, lang), oldLines, 'old');
+    add(originalText, oldLines, 'old');
   }
   return { ranges, functions: [...functions.values()], newText };
 }
@@ -112,16 +114,6 @@ function oldChangedLines(diff: string): number[] {
     }
   }
   return lines;
-}
-
-function innermostDef(defs: FunctionRange[], line0: number): FunctionRange | undefined {
-  let best: FunctionRange | undefined;
-  for (const d of defs) {
-    if (line0 >= d.startLine && line0 <= d.endLine && (!best || d.endLine - d.startLine < best.endLine - best.startLine)) {
-      best = d;
-    }
-  }
-  return best;
 }
 
 function span(a: number, b: number): number[] {

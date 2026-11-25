@@ -62,6 +62,15 @@ export interface ActivityViewModel {
   /** Timeline groups, newest last. Completed turns start collapsed (the webview remembers toggles). */
   turnGroups: TurnGroup[];
   selected?: OperationDetail;
+  /**
+   * The one step that should be open without a click: the first pending
+   * approval, else the running step, else the newest failure of the newest
+   * turn. Manual expansion in the webview wins over it.
+   */
+  focusId?: string;
+  focus?: OperationDetail;
+  /** Details of the step the user expanded by hand (when it is neither selected nor the focus). */
+  expanded?: OperationDetail;
 }
 
 export interface TurnGroup {
@@ -103,6 +112,8 @@ export interface OperationRow {
   /** Failed steps: a short reason from the recorded result/output (no model). */
   errorReason?: string;
   hasChange: boolean;
+  /** You are editing your own version of this pending proposal (edit before applying). */
+  editing?: boolean;
   cmd?: { summary: string; writes: boolean; writeTargets: string[]; writeReasons: string[]; long: boolean; embeddedCode: boolean; short: string; duration?: string; exitCode?: number; sourceWrite: boolean; mayGenerate: boolean };
 }
 
@@ -179,8 +190,8 @@ function groups(rows: OperationRow[], turns: NonNullable<import('../types/events
     if (r.awaitingApproval) g.pending++;
   }
   for (const g of out.values()) {
-    // Collapse completed turns; keep running ones, ones awaiting a decision, and untracked groups open.
-    g.open = g.pending > 0 || g.status === 'Running' || (g.status === undefined && (g.number === last || turns.length === 0));
+    // Earlier turns are collapsed; the newest turn (running or just finished), turns awaiting a decision and untracked groups stay open.
+    g.open = g.pending > 0 || g.status === 'Running' || g.number === last || (g.status === undefined && turns.length === 0);
   }
   return [...out.values()].sort((a, b) => a.number - b.number);
 }
@@ -209,7 +220,7 @@ function commandRow(op: AgentOperation): OperationRow['cmd'] {
 export function buildActivityViewModel(
   recorder: EventRecorder,
   snapshot: ControllerSnapshot,
-  ui: { follow: boolean; selectedTaskId?: string; selectedOperationId?: string; reviewerEnabled?: boolean; language?: UiLanguage },
+  ui: { follow: boolean; selectedTaskId?: string; selectedOperationId?: string; expandedOperationId?: string; reviewerEnabled?: boolean; language?: UiLanguage },
 ): ActivityViewModel {
   const lang = ui.language ?? 'en';
   const tr = translator(lang);
@@ -247,12 +258,10 @@ export function buildActivityViewModel(
   });
 
   const rendered = ops.slice(-MAX_RENDERED_OPERATIONS).map(row);
-  const selectedOp = ops.find((o) => o.operationId === ui.selectedOperationId);
-  let selected: OperationDetail | undefined;
-  if (selectedOp) {
+  const detail = (selectedOp: AgentOperation): OperationDetail => {
     const r = row(selectedOp);
     const change = selectedOp.associatedChangeId ? recorder.getChange(selectedOp.associatedChangeId) : undefined;
-    selected = {
+    return {
       ...r,
       timestamp: selectedOp.timestamp,
       rationale: selectedOp.rationale,
@@ -277,7 +286,19 @@ export function buildActivityViewModel(
       canReviewChange: !!selectedOp.associatedChangeId,
       canReveal: !!selectedOp.filePath,
     };
-  }
+  };
+  const selectedOp = ops.find((o) => o.operationId === ui.selectedOperationId);
+  const selected = selectedOp ? detail(selectedOp) : undefined;
+  const lastTurn = rendered.length ? rendered[rendered.length - 1].turn : 0;
+  const focusId =
+    rendered.find((r) => r.awaitingApproval)?.id ??
+    rendered.find((r) => r.isCurrent && (r.status === 'Running' || r.status === 'Proposed'))?.id ??
+    // A failure that a later step of the same kind on the same file recovered from (an agent's retry) is not news.
+    [...rendered].reverse().find((r, i, rev) => r.turn === lastTurn && r.status === 'Failed' && !rev.slice(0, i).some((later) => later.type === r.type && later.file === r.file && later.status === 'Completed'))?.id;
+  const focusOp = focusId ? ops.find((o) => o.operationId === focusId) : undefined;
+  const focus = focusOp ? (focusOp === selectedOp ? selected : detail(focusOp)) : undefined;
+  const expandedOp = ui.expandedOperationId ? ops.find((o) => o.operationId === ui.expandedOperationId) : undefined;
+  const expanded = expandedOp && expandedOp !== selectedOp && expandedOp !== focusOp ? detail(expandedOp) : undefined;
 
   return {
     header: {
@@ -299,7 +320,7 @@ export function buildActivityViewModel(
       canStop: isLive,
       follow: ui.follow,
       pauseUnsupported: active && !snapshot.capabilities.pause,
-      canSteer: isLive && snapshot.capabilities.steer && (!snapshot.capabilities.followUp || snapshot.awaitingInput),
+      canSteer: isLive && snapshot.capabilities.steer && (!snapshot.capabilities.followUp || !!snapshot.capabilities.steerWhileRunning || snapshot.awaitingInput),
       reviewerEnabled: !!ui.reviewerEnabled,
       canEndSession: isLive && snapshot.awaitingInput && !!snapshot.capabilities.followUp,
     },
@@ -316,6 +337,9 @@ export function buildActivityViewModel(
     conversation: task ? conversation(task, ops).slice(-20).map((m) => ({ ...m, text: m.text.length > 4000 ? m.text.slice(0, 4000) + '\n[…] — 查看对话历史 / Open conversation history' : m.text })) : [],
     turns: task?.turns ?? [],
     selected,
+    focusId,
+    focus,
+    expanded,
   };
 }
 

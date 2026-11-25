@@ -42,9 +42,9 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
   }
 
   /** Snapshot the target file and compute the proposed full-file text. */
-  prepare(change: ProposedChangeContent): void {
+  prepare(change: ProposedChangeContent, workspaceRoot?: string): void {
     this.displayed.delete(change.changeId);
-    this.prepared.set(change.changeId, this.compute(change));
+    this.prepared.set(change.changeId, this.compute(change, workspaceRoot));
   }
 
   has(changeId: string): boolean {
@@ -52,16 +52,16 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
   }
 
   /** Read-only access to a change's original/proposed text (memory only; undefined after reload). */
-  async getContent(changeId: string): Promise<{ change: ProposedChangeContent; original: string; proposed: string } | undefined> {
+  async getContent(changeId: string): Promise<PreparedChange | undefined> {
     const entry = this.prepared.get(changeId);
     if (!entry) {
       return undefined;
     }
     const p = await entry;
-    return { change: p.change, original: p.original, proposed: p.proposed };
+    return { change: p.change, original: p.original, proposed: p.proposed, note: p.note };
   }
 
-  async showDiff(changeId: string, options: { preserveFocus: boolean; viewColumn?: vscode.ViewColumn }): Promise<boolean> {
+  async showDiff(changeId: string, options: { preserveFocus: boolean; viewColumn?: vscode.ViewColumn; pending?: () => boolean }): Promise<boolean> {
     const entry = this.prepared.get(changeId);
     if (!entry) {
       void vscode.window.showWarningMessage(
@@ -70,21 +70,38 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
       return false;
     }
     const p = await entry;
+    if (options.pending && !options.pending()) return false;
     const base = path.basename(p.change.filePath);
     const target = p.change.functionName ? `${base} › ${p.change.functionName}()` : base;
     const title = p.change.unifiedDiff !== undefined
-      ? `${target}: Current ↔ Codex patch`
+      ? `${target}: Current ↔ Proposed patch`
       : `${target}: Original ↔ Proposed (not applied)`;
-    await vscode.commands.executeCommand('vscode.diff', this.uriFor(changeId, 'original', base), this.uriFor(changeId, 'proposed', base), title, {
+    const original = this.uriFor(changeId, 'original', base);
+    const proposed = this.uriFor(changeId, 'proposed', base);
+    await vscode.commands.executeCommand('vscode.diff', original, options.pending ? proposed.with({ query: 'proposal' }) : proposed, title, {
       preview: false,
       preserveFocus: options.preserveFocus,
       viewColumn: options.viewColumn,
     } satisfies vscode.TextDocumentShowOptions);
     this.displayed.add(changeId);
+    if (options.pending && !options.pending()) await this.closeProposalDiffs([changeId]);
     if (p.note) {
       void vscode.window.showWarningMessage(p.note);
     }
     return true;
+  }
+
+  async closeProposalDiffs(changeIds: readonly string[]): Promise<void> {
+    const ids = new Set(changeIds);
+    const tabs = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => {
+      const input = tab.input;
+      return !tab.isDirty && input instanceof vscode.TabInputTextDiff &&
+        input.modified.scheme === ChangeReviewManager.scheme && input.modified.query === 'proposal' &&
+        ids.has(input.modified.path.split('/')[1]);
+    });
+    if (tabs.length) await vscode.window.tabGroups.close(tabs, true).then(undefined, (error) => {
+      this.log.appendLine(`[review] Could not close resolved proposal diff: ${error}`);
+    });
   }
 
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
@@ -123,8 +140,8 @@ export class ChangeReviewManager implements vscode.TextDocumentContentProvider, 
     return vscode.Uri.from({ scheme: ChangeReviewManager.scheme, path: `/${changeId}/${side}/${basename}` });
   }
 
-  private async compute(change: ProposedChangeContent): Promise<PreparedChange> {
-    const resolved = this.navigator.resolve(change.filePath);
+  private async compute(change: ProposedChangeContent, workspaceRoot?: string): Promise<PreparedChange> {
+    const resolved = this.navigator.resolve(change.filePath, workspaceRoot);
     let original: string | undefined;
     let readProblem: string | undefined;
     if (!resolved.ok) {

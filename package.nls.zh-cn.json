@@ -66,5 +66,14 @@
   "cmd.reviewer.explainCommand": "解释命令（本地 AI，不执行）",
   "cmd.explainFile": "解释此文件（本地 AI）",
   "cmd.checkMyChanges": "检查我的修改（询问代理）",
-  "cmd.continueFromMyChanges": "基于我的修改继续"
+  "cmd.continueFromMyChanges": "基于我的修改继续",
+  "cmd.opencodeRestart": "重启 OpenCode 服务",
+  "cmd.opencodeStop": "停止 OpenCode 服务",
+  "cmd.opencodeStart": "启动 OpenCode 服务",
+  "cmd.opencodeShowLog": "显示 OpenCode 服务日志",
+  "cmd.opencodeMenu": "OpenCode 服务状态",
+  "config.local.server.autoStart": "何时启动本地 OpenCode 服务。健康时始终复用，只停止由本窗口启动的服务。",
+  "config.local.server.autoStart.onDemand": "在启动本地代理任务时（默认）。",
+  "config.local.server.autoStart.onActivation": "扩展启动时也启动，使用上次的本地模型和配置（不调用模型）。",
+  "config.local.server.idleStopMinutes": "本窗口启动的 OpenCode 服务在没有本地代理会话这么多分钟后停止。0 = 保持运行直到 VS Code 关闭。"
 }

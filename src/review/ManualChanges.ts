@@ -32,7 +32,14 @@ const MAX_TRACKED_BYTES = 1_500_000;
 const MAX_STORED_BYTES = 20_000_000;
 const STORE_VERSION = 1;
 
-type StoredBaselines = { version: number; tasks: Record<string, Record<string, { rel: string; text: string; at: string }>> };
+/**
+ * What the user changed when they applied their own version instead of the
+ * agent's proposal: `agent` → `user`. Later agent writes must keep it.
+ * `keepFile`: the user excluded a proposed deletion (protects against deleting it).
+ */
+type Protection = { agent: string; user: string; keepFile?: boolean };
+type Baseline = { rel: string; text: string; at: string; protect?: Protection };
+type StoredBaselines = { version: number; tasks: Record<string, Record<string, Baseline>> };
 
 /**
  * "Check my changes" / "Continue from my changes".
@@ -45,7 +52,7 @@ type StoredBaselines = { version: number; tasks: Record<string, Record<string, {
  * survived, and records the result as an operation.
  */
 export class ManualChanges implements vscode.Disposable {
-  private readonly baselines = new Map<string, Map<string, { rel: string; text: string; at: string }>>();
+  private readonly baselines = new Map<string, Map<string, Baseline>>();
   private readonly pending = new Map<string, { files: ManualChange[]; sawBusy: boolean }>();
   private readonly results = new Map<string, ManualCheckResult>();
   private readonly emitter = new vscode.EventEmitter<void>();
@@ -60,7 +67,7 @@ export class ManualChanges implements vscode.Disposable {
     controller: AgentController,
     private readonly send: (taskId: string, text: string) => Promise<boolean>,
     private readonly log: vscode.OutputChannel,
-    onUserVersion?: vscode.Event<{ taskId: string; abs: string; rel: string; text: string }>,
+    onUserVersion?: vscode.Event<{ taskId: string; abs: string; rel: string; text: string; agentProposed?: string }>,
     /** File that keeps baselines across window reloads (workspace storage, never the project). */
     private readonly storeFile?: vscode.Uri,
   ) {
@@ -68,7 +75,9 @@ export class ManualChanges implements vscode.Disposable {
     const rec = recorder.onDidChange((c) => void this.onRecorder(c));
     const ctl = controller.onDidChangeState((s) => void this.onState(s));
     this.disposables.push({ dispose: () => [rec, ctl].forEach((d) => d.dispose()) });
-    if (onUserVersion) this.disposables.push(onUserVersion((e) => this.setBaseline(e.taskId, e.abs, e.rel, e.text)));
+    if (onUserVersion) this.disposables.push(onUserVersion((e) =>
+          this.setBaseline(e.taskId, e.abs, e.rel, e.text, e.agentProposed === undefined || e.agentProposed === e.text ? undefined : { agent: e.agentProposed, user: e.text, keepFile: e.agentProposed === '' && e.text !== '' }),
+        ));
   }
 
   /** Where baselines are persisted (workspace storage), for diagnostics and tests. */
@@ -95,7 +104,7 @@ export class ManualChanges implements vscode.Disposable {
     await this.loaded;
     const out: ManualChange[] = [];
     for (const [abs, b] of this.baselines.get(taskId) ?? []) {
-      const open = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, abs));
+      const open = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, abs) && d.isDirty) ?? vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, abs));
       const current = await readText(abs);
       const diff = createUnifiedDiff(b.text, current ?? '') ?? '';
       if (!diff && !open?.isDirty) continue;
@@ -148,8 +157,20 @@ export class ManualChanges implements vscode.Disposable {
     const b = this.findBaseline(taskId, abs);
     if (!b) return [];
     const current = await readText(abs);
-    if (current === undefined || current === b.text) return [];
-    return checkPreserved(b.text, current, proposed).lost;
+    if (current === undefined) return [];
+    const lost = current === b.text ? [] : checkPreserved(b.text, current, proposed).lost;
+    // Changes the user made when applying their own version instead of an agent proposal,
+    // as long as they are still in the file (the user may remove them later themselves).
+    const p = b.protect;
+    if (p?.keepFile) {
+      if (proposed === '' && current !== '') lost.push({ line: 1, added: [`(the user chose to keep ${b.rel}; deleting it was excluded)`], removed: [], why: 'added lines missing' });
+    } else if (p) {
+      const goneAlready = checkPreserved(p.agent, p.user, current).lost;
+      const key = (h: { line: number; why: string }) => `${h.line}:${h.why}`;
+      const skip = new Set([...goneAlready, ...lost].map(key));
+      lost.push(...checkPreserved(p.agent, p.user, proposed).lost.filter((h) => !skip.has(key(h))));
+    }
+    return lost;
   }
 
   /** The user's manual edits to a file since the agent's last applied version (none → false). */
@@ -158,7 +179,7 @@ export class ManualChanges implements vscode.Disposable {
     const b = this.findBaseline(taskId, abs);
     if (!b) return false;
     const current = await readText(abs);
-    return current !== undefined && current !== b.text;
+    return current !== undefined && (current !== b.text || !!b.protect);
   }
 
   dispose(): void {
@@ -171,7 +192,7 @@ export class ManualChanges implements vscode.Disposable {
 
   // ------------------------------------------------------------ internals
 
-  private findBaseline(taskId: string, abs: string): { rel: string; text: string; at: string } | undefined {
+  private findBaseline(taskId: string, abs: string): Baseline | undefined {
     for (const [k, v] of this.baselines.get(taskId) ?? []) if (samePath(k, abs)) return v;
     return undefined;
   }
@@ -185,7 +206,10 @@ export class ManualChanges implements vscode.Disposable {
         if (!this.recorder.getTask(taskId)) continue; // history was cleared or trimmed
         const m = this.baselines.get(taskId) ?? new Map();
         for (const [abs, b] of Object.entries(files)) {
-          if (typeof b?.text === 'string' && typeof b.rel === 'string' && !m.has(abs)) m.set(abs, { rel: b.rel, text: b.text, at: String(b.at ?? '') });
+          if (typeof b?.text === 'string' && typeof b.rel === 'string' && !m.has(abs)) {
+            const protect = b.protect && typeof b.protect.agent === 'string' && typeof b.protect.user === 'string' ? { agent: b.protect.agent, user: b.protect.user, keepFile: b.protect.keepFile === true } : undefined;
+            m.set(abs, { rel: b.rel, text: b.text, at: String(b.at ?? ''), protect });
+          }
         }
         if (m.size) this.baselines.set(taskId, m);
       }
@@ -208,13 +232,13 @@ export class ManualChanges implements vscode.Disposable {
   /** Persist newest baselines first, within a total size cap. */
   async save(): Promise<void> {
     if (!this.storeFile) return;
-    const all: Array<{ taskId: string; abs: string; b: { rel: string; text: string; at: string } }> = [];
+    const all: Array<{ taskId: string; abs: string; b: Baseline }> = [];
     for (const [taskId, m] of this.baselines) for (const [abs, b] of m) all.push({ taskId, abs, b });
     all.sort((x, y) => y.b.at.localeCompare(x.b.at));
     const out: StoredBaselines = { version: STORE_VERSION, tasks: {} };
     let used = 0;
     for (const e of all) {
-      used += e.b.text.length;
+      used += e.b.text.length + (e.b.protect ? e.b.protect.agent.length + e.b.protect.user.length : 0);
       if (used > MAX_STORED_BYTES) break;
       (out.tasks[e.taskId] ??= {})[e.abs] = e.b;
     }
@@ -244,8 +268,9 @@ export class ManualChanges implements vscode.Disposable {
       );
       if (!choice) throw new Error('Cancelled: unsaved edits were not sent.');
       for (const c of unsaved) {
-        const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, c.abs));
-        if (doc && !(await doc.save())) throw new Error(`Could not save ${c.rel}.`);
+        for (const doc of vscode.workspace.textDocuments.filter((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, c.abs) && d.isDirty)) {
+          if (!(await doc.save())) throw new Error(`Could not save ${c.rel}.`);
+        }
       }
       changes = await this.detect(taskId);
     }
@@ -285,12 +310,14 @@ export class ManualChanges implements vscode.Disposable {
     }
   }
 
-  private setBaseline(taskId: string, abs: string, rel: string, text: string): void {
+  /** A new baseline keeps an earlier protection unless a new one is given (agent writes cannot remove it without approval). */
+  private setBaseline(taskId: string, abs: string, rel: string, text: string, protect?: Protection): void {
     if (text.length > MAX_TRACKED_BYTES) return;
     let m = this.baselines.get(taskId);
     if (!m) this.baselines.set(taskId, (m = new Map()));
-    for (const k of [...m.keys()]) if (samePath(k, abs)) m.delete(k);
-    m.set(abs, { rel, text, at: new Date().toISOString() });
+    let previous: Protection | undefined;
+    for (const k of [...m.keys()]) if (samePath(k, abs)) { previous = m.get(k)!.protect; m.delete(k); }
+    m.set(abs, { rel, text, at: new Date().toISOString(), protect: protect ?? previous });
     this.scheduleSave();
     this.emitter.fire();
   }

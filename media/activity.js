@@ -40,14 +40,67 @@
 
   let lastSelected = /** @type {string|undefined} */ (undefined);
   /** Per-panel UI state: expanded step, open "…" menu, turn groups the user toggled. */
-  const ui = Object.assign({ expanded: undefined, menu: undefined, turns: {} }, ((vscode.getState && vscode.getState()) || {}).ui || {});
+  const ui = Object.assign({ expanded: undefined, dismissed: undefined, menu: undefined, turns: {}, open: {} }, ((vscode.getState && vscode.getState()) || {}).ui || {});
   const saveUi = () => {
     try {
-      vscode.setState({ ...((vscode.getState && vscode.getState()) || {}), ui: { expanded: ui.expanded, turns: ui.turns } });
+      vscode.setState({ ...((vscode.getState && vscode.getState()) || {}), ui: { expanded: ui.expanded, dismissed: ui.dismissed, turns: ui.turns, open: ui.open } });
     } catch {
       /* state is a convenience only */
     }
   };
+  /** Dismiss only action menus; leave expanded steps and turn groups intact. */
+  function closeMenus(except = null, restoreFocus = false) {
+    for (const menu of document.querySelectorAll('details.more[open]')) {
+      if (menu === except) continue;
+      menu.removeAttribute('open');
+      if (restoreFocus) menu.querySelector('summary')?.focus();
+    }
+    if (!except) ui.menu = undefined;
+  }
+  document.addEventListener('pointerdown', (event) => {
+    const target = event.target;
+    closeMenus(target instanceof Element ? target.closest('details.more') : null);
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && document.querySelector('details.more[open]')) {
+      event.preventDefault();
+      closeMenus(null, true);
+    }
+  });
+  window.addEventListener('blur', () => closeMenus());
+  /** <details> the user toggled keep their state across re-renders; others use their default. @param {HTMLDetailsElement} d @param {string} key @param {boolean} dflt */
+  function remember(d, key, dflt) {
+    d.open = key in ui.open ? ui.open[key] : dflt;
+    d.addEventListener('toggle', () => {
+      if (!d.isConnected) return;
+      ui.open[key] = d.open;
+      saveUi();
+    });
+    return d;
+  }
+  /** Decisions clicked but not yet reflected in the state: their buttons stay disabled (no double decisions). */
+  const inflight = /** @type {Record<string, number>} */ ({});
+  /** When each pending approval was first shown: a card that just appeared ignores clicks briefly (no double click into the next proposal). */
+  const shownAt = /** @type {Record<string, number>} */ ({});
+  const ARM_MS = 700;
+  /** @param {string} id */
+  // Also right after any decision here: the next card can move under the mouse (layout shift) and must not take the second click.
+  let lastDecisionAt = 0;
+  const armed = (id) => Date.now() - (shownAt[id] || 0) >= ARM_MS && Date.now() - lastDecisionAt >= ARM_MS;
+  /** @param {string} action @param {string} id */
+  const decide = (action, id) => {
+    if (!armed(id)) return;
+    if (inflight[id] && Date.now() - inflight[id] < 4000) return;
+    inflight[id] = Date.now();
+    lastDecisionAt = Date.now();
+    setTimeout(() => lastModel && render(lastModel), ARM_MS + 20);
+    setTimeout(() => lastModel && render(lastModel), 4020); // if the decision did not go through (e.g. a dialog was cancelled), enable the buttons again
+    act(action, id);
+    if (lastModel) render(lastModel);
+  };
+  /** @type {any} */
+  let lastModel;
+  let lastFocus = /** @type {string|undefined} */ (undefined);
   let conversationOpen = false;
   /** @type {Record<string,string>} */
   let STR = {};
@@ -73,18 +126,23 @@
     return c && c.writes ? el('span', { class: 'pill writes', text: S('c.writes'), title: S('c.heuristicTip') + ': ' + c.writeReasons.join('; ') + (c.writeTargets.length ? ' → ' + c.writeTargets.join(', ') : '') }) : null;
   }
   /** Full original command; long commands and embedded code start collapsed. @param {string} command @param {any} c @param {boolean} [open] */
-  function fullCommand(command, c, open) {
+  function fullCommand(command, c, open, key) {
     const d = el('details', { class: 'full-command' }, [
       el('summary', { text: c && (c.long || c.embeddedCode) ? S(c.embeddedCode ? 'c.fullCommandCode' : 'c.fullCommand') + ' · ' + S('c.chars', { n: command.length }) : S('c.fullCommand') }),
       el('pre', { class: 'mono', text: command }),
     ]);
-    if (open || !(c && (c.long || c.embeddedCode))) /** @type {HTMLDetailsElement} */ (d).open = true;
+    const dflt = !!(open || !(c && (c.long || c.embeddedCode)));
+    if (key) remember(/** @type {HTMLDetailsElement} */ (d), key, dflt);
+    else /** @type {HTMLDetailsElement} */ (d).open = dflt;
     return d;
   }
 
   /** @param {any} m */
   function render(m) {
+    lastModel = m;
     STR = m.strings || {};
+    for (const id of Object.keys(inflight)) if (!m.operations.some((/** @type {any} */ o) => o.id === id && o.awaitingApproval) || Date.now() - inflight[id] > 4000) delete inflight[id];
+    for (const o of m.operations) if (o.awaitingApproval && !shownAt[o.id]) { shownAt[o.id] = Date.now(); setTimeout(() => lastModel && render(lastModel), ARM_MS + 20); }
     const scrollTop = document.scrollingElement ? document.scrollingElement.scrollTop : 0;
     // Preserve keyboard focus across re-renders.
     const active = document.activeElement;
@@ -103,17 +161,44 @@
           languageSelect(m.language),
         ]),
         el('div', { class: 'muted small', text: m.header.adapterName }),
-        m.header.boundary && el('div', { class: 'boundary small', text: S('a.boundary') + ': ' + m.header.boundary }),
+        m.header.boundary && el('div', { class: 'boundary small clamp', text: S('a.boundary') + ': ' + m.header.boundary, title: m.header.boundary }),
         m.header.liveTracking && el('div', { class: 'live small', title: S('a.liveTrackingTip') }, [
           el('span', { class: 'live-dot', text: '●' }),
           el('span', { text: ' ' + S('a.liveTracking') }),
           m.header.currentOperation && el('span', { class: 'muted', text: ` · ${S('a.now')}: ` + m.header.currentOperation }),
         ]),
         m.header.awaitingInput && el('div', { class: 'approval small', text: S('a.awaitingInput') }),
-        m.header.taskDescription && el('div', { class: 'task-desc', text: m.header.taskDescription }),
+        m.header.taskDescription && el('div', { class: 'task-desc clamp', text: m.header.taskDescription, title: m.header.taskDescription }),
         m.header.workspaceRoot && el('div', { class: 'small muted', text: S('nt.workspace') + ': ' + m.header.workspaceRoot }),
       ]),
     );
+
+    // ---- Approval banner: right under the status, so a pending decision is visible without scrolling
+    const allWaiting = m.operations.filter((/** @type {any} */ o) => o.awaitingApproval);
+    const waiting = allWaiting[0];
+    const busy = !!(waiting && (inflight[waiting.id] || !armed(waiting.id)));
+    if (waiting) {
+      app.appendChild(
+        el('section', { class: 'approval', attrs: { role: 'alert' } }, [
+          el('div', { class: 'approval-title', text: allWaiting.length > 1 ? S('a.approvalNeededN', { n: allWaiting.length }) : S('a.approvalNeeded') }),
+          el('div', {}, [el('span', { text: waiting.cmd ? waiting.cmd.summary : waiting.description }), waiting.cmd && el('span', { text: ' ' }), writesPill(waiting.cmd)]),
+          waiting.cmd && !waiting.cmd.writes && el('div', { class: 'muted small', text: S(waiting.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected') }),
+          waiting.cmd && fullCommand(waiting.description.replace(/^(Run tests|Run): /, ''), waiting.cmd, false, 'cmd-banner:' + waiting.id),
+          !waiting.simulated && waiting.type === 'Edit' && el('div', { class: 'small', text: S('a.approveAppliesPatch') }),
+          waiting.file && el('div', { class: 'muted small', text: [waiting.file, waiting.fn && `${waiting.fn}()`].filter(Boolean).join(' › ') }),
+          el('div', { class: 'btn-row' }, [
+            waiting.hasChange && button(S('a.reviewDiff'), () => act('review', waiting.id), { title: S('a.reviewDiffTip') }),
+            waiting.editing
+              ? button(S('p.applyMine'), () => act('applyEdited', waiting.id), { kind: 'primary', disabled: busy, title: S('p.applyMineTip') })
+              : button(S('a.approve'), () => decide('approve', waiting.id), { kind: 'primary', disabled: busy }),
+            button(S('a.reject'), () => decide('reject', waiting.id), { kind: 'danger', disabled: busy }),
+            !waiting.simulated && waiting.type === 'Edit' && waiting.hasChange && button(waiting.editing ? S('p.files') : S('p.editFirst'), () => act('editProposal', waiting.id), { title: S('p.editFirstTip'), disabled: busy }),
+            waiting.editing && button(S('p.cancelEdit'), () => act('cancelEdit', waiting.id)),
+            !waiting.simulated && button(S('p.regenerate'), () => decide('regenerate', waiting.id), { title: S('p.regenerateTip'), disabled: busy }),
+          ]),
+        ]),
+      );
+    }
 
     // ---- Controls
     const c = m.controls;
@@ -123,7 +208,7 @@
     app.appendChild(
       el('section', { class: 'controls', attrs: { 'aria-label': S('a.controls') } }, [
         el('div', { class: 'btn-row' }, [
-          button(S('a.startDemo'), () => act('start'), { disabled: !c.canStart, kind: 'primary', title: S('a.startDemoTip') }),
+          button(S('a.startDemo'), () => act('start'), { disabled: !c.canStart, kind: m.tasks.length ? '' : 'primary', title: S('a.startDemoTip') }),
           button(S('a.newTask'), () => act('newTask'), { disabled: !c.canNewTask, title: S('a.newTaskTip') }),
           button(S('chat.title'), () => act('openChat')),
           c.canResume
@@ -163,7 +248,6 @@
         el('summary', { text: S('a.conversation') }),
         el('p', { class: 'small muted', text: S('a.conversationHint') }),
         el('div', { class: 'btn-row' }, [
-          button(S('chat.open'), () => act('openChat')),
           button(S('a.openConversation'), () => act('conversation')),
           button(S('a.continueHistory'), () => act('continueHistory'), { disabled: !c.canStart }),
         ]),
@@ -180,34 +264,16 @@
       app.appendChild(transcript);
     }
 
-    // ---- Approval banner
-    const allWaiting = m.operations.filter((/** @type {any} */ o) => o.awaitingApproval);
-    const waiting = allWaiting[0];
-    if (waiting) {
-      app.appendChild(
-        el('section', { class: 'approval', attrs: { role: 'alert' } }, [
-          el('div', { class: 'approval-title', text: allWaiting.length > 1 ? S('a.approvalNeededN', { n: allWaiting.length }) : S('a.approvalNeeded') }),
-          el('div', {}, [el('span', { text: waiting.cmd ? waiting.cmd.summary : waiting.description }), waiting.cmd && el('span', { text: ' ' }), writesPill(waiting.cmd)]),
-          waiting.cmd && !waiting.cmd.writes && el('div', { class: 'muted small', text: S(waiting.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected') }),
-          waiting.cmd && fullCommand(waiting.description.replace(/^(Run tests|Run): /, ''), waiting.cmd),
-          !waiting.simulated && waiting.type === 'Edit' && el('div', { class: 'small', text: S('a.approveAppliesPatch') }),
-          waiting.file && el('div', { class: 'muted small', text: [waiting.file, waiting.fn && `${waiting.fn}()`].filter(Boolean).join(' › ') }),
-          el('div', { class: 'btn-row' }, [
-            button(S('a.reviewDiff'), () => act('review', waiting.id), { title: S('a.reviewDiffTip') }),
-            button(S('a.approve'), () => act('approve', waiting.id), { kind: 'primary' }),
-            button(S('a.reject'), () => act('reject', waiting.id), { kind: 'danger' }),
-            !waiting.simulated && waiting.type === 'Edit' && button(S('p.editFirst'), () => act('editProposal', waiting.id), { title: S('p.editFirstTip') }),
-            !waiting.simulated && button(S('p.regenerate'), () => act('regenerate', waiting.id), { title: S('p.regenerateTip') }),
-          ]),
-        ]),
-      );
-    }
-
     // ---- Timeline, grouped by conversation turn. Completed turns start collapsed.
     const timeline = el('section', { class: 'timeline-section', attrs: { 'aria-label': S('a.operations') } }, [el('h3', { text: S('a.timeline') })]);
     if (!m.operations.length) timeline.appendChild(el('p', { class: 'muted empty', text: S('a.noOps') }));
     if (m.hiddenOperationCount > 0) timeline.appendChild(el('p', { class: 'muted small', text: S('a.hiddenOps', { n: m.hiddenOperationCount }) }));
     const s = m.selected;
+    if (ui.dismissed && ui.dismissed !== m.focusId) ui.dismissed = undefined;
+    if (ui.expanded && !m.operations.some((/** @type {any} */ o) => o.id === ui.expanded)) ui.expanded = undefined;
+    const openId = ui.expanded || (m.focusId && ui.dismissed !== m.focusId ? m.focusId : undefined);
+    /** @param {string} id */
+    const detailFor = (id) => (s && s.id === id ? s : m.focus && m.focus.id === id ? m.focus : m.expanded && m.expanded.id === id ? m.expanded : undefined);
     for (const g of m.turnGroups || []) {
       const key = `${m.selectedTaskId}:${g.number}`;
       const group = /** @type {HTMLDetailsElement} */ (el('details', { class: 'turn-group', attrs: { 'data-key': 'turn:' + key } }));
@@ -227,19 +293,67 @@
         ]),
       );
       const list = el('ol', { class: 'timeline' });
-      for (const o of m.operations.filter((/** @type {any} */ x) => x.turn === g.number)) list.appendChild(stepItem(o, s && s.id === o.id ? s : undefined));
+      const rows = m.operations.filter((/** @type {any} */ x) => x.turn === g.number);
+      for (let i = 0; i < rows.length; ) {
+        // Runs of 3+ finished reads/searches, or of the same failure repeated (retries), become one collapsed row.
+        const k = runKey(rows[i]);
+        let j = i;
+        while (k && j < rows.length && runKey(rows[j]) === k) j++;
+        if (j - i >= 3) {
+          list.appendChild(runItem(rows.slice(i, j)));
+          i = j;
+        } else {
+          list.appendChild(stepItem(rows[i], s && s.id === rows[i].id ? s : undefined));
+          i++;
+        }
+      }
       group.appendChild(list);
       timeline.appendChild(group);
     }
     app.appendChild(timeline);
 
+    /** Steps with the same key next to each other are grouped. @param {any} o */
+    function runKey(o) {
+      if (o.awaitingApproval || o.isCurrent || o.id === openId) return '';
+      if (o.type === 'Read' && o.status === 'Completed' && !o.errorReason) return 'read';
+      if (o.status === 'Failed') return `failed:${o.type}:${o.file || ''}`;
+      return '';
+    }
+    /** Consecutive finished reads/searches as one row; open to see each. @param {any[]} items */
+    function runItem(items) {
+      const names = items.map((o) => o.file || o.description).filter(Boolean);
+      const shown = [...new Set(names)].slice(0, 3).join(', ') + (new Set(names).size > 3 ? ', …' : '');
+      const failed = items[0].status === 'Failed';
+      const d = /** @type {HTMLDetailsElement} */ (el('details', { class: 'op-run', attrs: { 'data-key': 'run:' + items[0].id } }, [
+        el('summary', { class: 'small' }, [
+          el('span', { class: `type type-${items[0].type.toLowerCase()}`, text: S('type.' + items[0].type) }),
+          failed && el('span', { text: ' ' }),
+          failed && badge('Failed', 'small'),
+          el('span', { text: ` × ${items.length} · #${items[0].seq}–#${items[items.length - 1].seq}` }),
+          failed && items[items.length - 1].errorReason && el('div', { class: 'op-error', text: items[items.length - 1].errorReason }),
+          shown && el('span', { class: 'muted', text: ' · ' + shown }),
+        ]),
+        el('ol', { class: 'timeline' }, items.map((o) => stepItem(o, s && s.id === o.id ? s : undefined))),
+      ]));
+      return el('li', {}, [remember(d, 'run:' + items[0].id, false)]);
+    }
+
     /** One step: title (toggles brief details), one primary action, "…" for the rest. @param {any} o @param {any} detail */
     function stepItem(o, detail) {
-      const expanded = ui.expanded === o.id;
+      const expanded = openId === o.id;
+      detail = detail || (expanded ? detailFor(o.id) : undefined);
       const where = [o.file, o.fn && `${o.fn}()`].filter(Boolean).join(' › ');
       const toggle = () => {
-        ui.expanded = expanded ? undefined : o.id;
+        if (expanded) {
+          // Closing the automatically opened step keeps it closed until the focus moves on.
+          if (ui.expanded !== o.id) ui.dismissed = o.id;
+          ui.expanded = undefined;
+        } else {
+          ui.expanded = o.id;
+        }
         saveUi();
+        // The extension keeps sending this step's details even when Follow selects newer steps.
+        send({ type: 'expand', operationId: ui.expanded || null });
         if (!expanded) send({ type: 'select', operationId: o.id, reveal: false });
         else render(m);
       };
@@ -265,7 +379,8 @@
           o.errorReason && el('div', { class: 'op-error', text: o.errorReason }),
         ],
       );
-      const primary = primaryButton(o, toggle);
+      // The pending approval is decided in the banner above; no second set of buttons on its row.
+      const primary = waiting && o.id === waiting.id ? null : primaryButton(o, toggle);
       const row = el('div', { class: `op ${detail ? 'selected' : ''} ${o.isCurrent ? 'current' : ''} ${o.awaitingApproval ? 'waiting' : ''}` }, [
         title,
         el('div', { class: 'op-actions' }, [primary, moreMenu(o)]),
@@ -275,7 +390,7 @@
 
     /** @param {any} o @param {() => void} toggle */
     function primaryButton(o, toggle) {
-      const inline = () => (ui.expanded === o.id ? undefined : toggle());
+      const inline = () => (openId === o.id ? undefined : toggle());
       switch (o.primary) {
         case 'review':
           return button(S('a.reviewChanges'), () => act('review', o.id), { kind: 'primary', title: S('a.reviewDiffTip') });
@@ -306,8 +421,8 @@
         o.hasCommand && m.controls.reviewerEnabled && button(S('c.explain'), () => act('aiExplainCommand', o.id), { title: S('c.explainTip') }),
         o.hasChange && m.controls.reviewerEnabled && button(S('a.aiReview'), () => act('aiReviewChange', o.id), { title: S('a.aiReviewTip') }),
         o.errorReason && o.hasCommand && m.controls.reviewerEnabled && button(S('a.aiError'), () => act('aiExplainError', o.id), { title: S('a.aiErrorTip') }),
-        o.awaitingApproval && !o.simulated && o.type === 'Edit' && o.hasChange && button(S('p.editFirst'), () => act('editProposal', o.id), { title: S('p.editFirstTip') }),
-        o.awaitingApproval && !o.simulated && button(S('p.regenerate'), () => act('regenerate', o.id), { title: S('p.regenerateTip') }),
+        o.awaitingApproval && (!waiting || o.id !== waiting.id) && !o.simulated && o.type === 'Edit' && o.hasChange && button(S('p.editFirst'), () => act('editProposal', o.id), { title: S('p.editFirstTip') }),
+        o.awaitingApproval && (!waiting || o.id !== waiting.id) && !o.simulated && button(S('p.regenerate'), () => decide('regenerate', o.id), { title: S('p.regenerateTip') }),
         button(S('a.export'), () => act('exportContext', o.id), { title: S('a.exportTip') }),
         button(S('a.fullRecord'), () => act('record', o.id), { title: S('a.fullRecordTip') }),
       ].filter(Boolean);
@@ -318,7 +433,12 @@
       ]));
       menu.open = ui.menu === o.id;
       menu.addEventListener('toggle', () => {
+        if (!menu.isConnected) return;
+        if (menu.open) closeMenus(menu);
         ui.menu = menu.open ? o.id : ui.menu === o.id ? undefined : ui.menu;
+      });
+      menu.addEventListener('click', (event) => {
+        if (event.target instanceof Element && event.target.closest('button')) closeMenus();
       });
       return menu;
     }
@@ -326,11 +446,13 @@
     /** Brief inline details from the selected operation (full record via "…"). @param {any} d */
     function briefDetails(d) {
       const box = el('div', { class: 'brief', attrs: { 'aria-label': S('a.detailsAria') } });
-      if (d.canApprove || d.canReject) {
+      // Further pending approvals (the first one is in the banner) can be decided here.
+      if ((d.canApprove || d.canReject) && !(waiting && waiting.id === d.id)) {
+        const busyHere = !!inflight[d.id] || !armed(d.id);
         box.appendChild(el('div', { class: 'btn-row' }, [
           d.canReviewChange && button(S('a.reviewChanges'), () => act('review', d.id), { title: S('a.reviewDiffTip') }),
-          d.canApprove && button(S('a.approve'), () => act('approve', d.id), { kind: 'primary' }),
-          d.canReject && button(S('a.reject'), () => act('reject', d.id), { kind: 'danger' }),
+          d.canApprove && button(S('a.approve'), () => decide('approve', d.id), { kind: 'primary', disabled: busyHere }),
+          d.canReject && button(S('a.reject'), () => decide('reject', d.id), { kind: 'danger', disabled: busyHere }),
         ]));
       }
       if (d.errorReason) {
@@ -348,13 +470,13 @@
           d.cmd && d.cmd.sourceWrite && d.status === 'Rejected' && el('div', { class: 'warn small', text: S('c.blockedWrite') }),
           d.cmd && !d.cmd.writes && el('div', { class: 'muted small', text: S(d.cmd.mayGenerate ? 'c.mayGenerate' : 'c.noWriteDetected') }),
           d.command.simulated && el('span', { class: 'pill sim', text: S('a.simulated') }),
-          fullCommand(d.command.command, d.cmd),
+          fullCommand(d.command.command, d.cmd, false, 'cmd:' + d.id),
           el('dl', { class: 'fields' }, facts.flatMap(([k, v]) => [el('dt', { text: k }), el('dd', { class: 'mono', text: v })])),
-          out && el('details', { attrs: d.errorReason || out.length < 4000 ? { open: '' } : {} }, [
+          out && remember(/** @type {HTMLDetailsElement} */ (el('details', {}, [
             el('summary', { text: (d.command.outputCombined ? S('a.outputCombined') : S('a.output')) + ' · ' + S('c.chars', { n: out.length }) }),
             el('pre', { text: d.command.stdout || '' }),
             d.command.stderr && el('pre', { class: 'stderr', text: d.command.stderr }),
-          ]),
+          ])), 'out:' + d.id, !!(d.errorReason || out.length < 4000)),
         ]));
       } else if (d.resultSummary) {
         const long = d.resultSummary.length > 1500;
@@ -377,7 +499,7 @@
       }
       if (d.rationale) box.appendChild(el('div', { class: 'small muted', text: d.rationale }));
       // Audit trail stays complete, folded by default.
-      const trail = el('details', { class: 'audit' }, [el('summary', { text: `${S('a.auditTrail')} (${d.history.length})` })]);
+      const trail = remember(/** @type {HTMLDetailsElement} */ (el('details', { class: 'audit' }, [el('summary', { text: `${S('a.auditTrail')} (${d.history.length})` })])), 'audit:' + d.id, false);
       trail.appendChild(el('div', { class: 'small muted', text: d.controlExplanation }));
       const history = el('ol', { class: 'history' });
       for (const h of d.history) {
@@ -400,6 +522,13 @@
         : app.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
       if (target instanceof HTMLElement && !target.hasAttribute('disabled')) target.focus({ preventScroll: true });
     }
+    // Keep a newly focused step (approval, running step, failure) in view when Follow is on.
+    if (m.focusId && m.focusId !== lastFocus && m.controls.follow && !ui.expanded) {
+      // A pending approval is decided in the banner at the top: keep the banner in view, not its row.
+      const node = waiting && waiting.id === m.focusId ? app.querySelector('section.approval') : app.querySelector(`[data-id="${CSS.escape(m.focusId)}"]`);
+      if (node) node.scrollIntoView({ block: 'nearest' });
+    }
+    lastFocus = m.focusId;
     // Keep a newly selected row visible.
     if (s && s.id !== lastSelected) {
       const node = app.querySelector(`[data-id="${CSS.escape(s.id)}"]`);
@@ -414,4 +543,5 @@
   });
 
   send({ type: 'ready' });
+  if (ui.expanded) send({ type: 'expand', operationId: ui.expanded });
 })();

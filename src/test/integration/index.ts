@@ -16,6 +16,11 @@ import { ConversationPanel } from '../../ui/ConversationPanel';
 import { ExplainPanel } from '../../reviewer/ExplainPanel';
 import { ManualChanges } from '../../review/ManualChanges';
 import { isInside } from '../../navigation/pathSafety';
+import { MultiFileAgent } from '../support/multiFileAgent';
+import { commandItem, FakeCodexServer } from '../support/fakeCodex';
+import { CodexAppServerAdapter } from '../../adapters/codex/CodexAppServerAdapter';
+import { CodexRpcClient } from '../../adapters/codex/CodexRpcClient';
+import { getProfile } from '../../adapters/codex/profiles';
 
 type Case = [string, (api: VisualAgentApi) => Promise<void>];
 
@@ -92,9 +97,20 @@ const cases: Case[] = [
       assert.match(proposed, /concentration must be >= 0/);
       assert.match(proposed, /def summarize\(samples\):/);
       assert.equal(original, before.get('validation.py'));
+      assert.equal(input.modified.query, 'proposal');
+      const historyUri = input.modified.with({ query: '' });
+      await vscode.commands.executeCommand('vscode.diff', input.original, historyUri, 'Historical comparison', { preview: false });
 
       await vscode.commands.executeCommand('visualAgent.approve');
       await controller.whenIdle();
+      const diffIsOpen = (uri: vscode.Uri) => vscode.window.tabGroups.all.some((group) =>
+        group.tabs.some((tab) => tab.input instanceof vscode.TabInputTextDiff && tab.input.modified.toString() === uri.toString()));
+      await waitUntil(() => !diffIsOpen(input.modified), 'resolved proposal diff closed');
+      assert.ok(diffIsOpen(historyUri), 'historical comparison stays open');
+      assert.equal((await vscode.workspace.openTextDocument(historyUri)).getText(), proposed);
+      const historyTab = vscode.window.tabGroups.all.flatMap((group) => group.tabs).find((tab) =>
+        tab.input instanceof vscode.TabInputTextDiff && tab.input.modified.toString() === historyUri.toString());
+      if (historyTab) await vscode.window.tabGroups.close(historyTab, true);
 
       const ops = recorder.getOperations(taskId);
       assert.deepEqual(ops.map((o) => o.status), ['Completed', 'Completed', 'Completed', 'Completed', 'Completed', 'Completed', 'Completed']);
@@ -260,13 +276,25 @@ const v03Cases: Case[] = [
     'reviewer: review the recorded change of the demo Edit operation',
     async ({ recorder, reviewerController }) => {
       const edit = recorder.getOperations().filter((o) => o.operationType === 'Edit' && o.associatedChangeId).at(-1)!;
-      const r = await reviewerController.reviewChange(edit.operationId);
-      assert.equal(r?.status, 'done');
-      const sent = fakeOllama!.chatRequests.at(-1).messages[1].content as string;
-      assert.match(sent, /```diff/);
-      assert.match(sent, /concentration must be >= 0/, 'modified code included');
-      assert.match(sent, /Original code/);
-      assert.match(sent, /operation #5/);
+      const fake = fakeOllama!;
+      const previous = fake.respond;
+      fake.respond = (request) => {
+        const sent = request.messages[1].content as string;
+        const line = /^\s*(\d+) \| .*concentration must be >= 0/m.exec(sent)?.[1];
+        const finding = { file: 1, side: 'after', line: Number(line), quote: 'concentration must be >= 0', status: 'change', message: 'Validates the concentration.' };
+        return [JSON.stringify([finding, finding, { ...finding, side: 'before', message: 'Reversed evidence.' }])];
+      };
+      try {
+        const r = await reviewerController.reviewChange(edit.operationId);
+        assert.equal(r?.status, 'done');
+        assert.equal(r?.text.match(/Validates the concentration/g)?.length, 1);
+        assert.doesNotMatch(r!.text, /Reversed evidence/);
+        const sent = fake.chatRequests.at(-1).messages[1].content as string;
+        assert.match(sent, /after function[\s\S]*concentration must be >= 0[\s\S]*before function/);
+        assert.match(sent, /operation #5/);
+      } finally {
+        fake.respond = previous;
+      }
     },
   ],
   [
@@ -464,8 +492,10 @@ const v04Cases: Case[] = [
   ],
   [
     'conversation workspace: explain, approved edit and real test, follow-up, close and native resume',
-    async ({ launcher, recorder, controller, controls }) => {
+    async ({ launcher, recorder, controller, controls, reviewer }) => {
       const project = fs.mkdtempSync(path.join(process.env.VAW_TEST_TEMP_DIR || os.tmpdir(), 'vaw-conversation-ui-'));
+      const ollama = new FakeOllama();
+      const previousEndpoint = vscode.workspace.getConfiguration('visualAgent.reviewer').get<string>('endpoint');
       const math = 'function divide(a, b) { return a / b; }\nmodule.exports = { divide };\n';
       const changed = 'function divide(a, b) { if (b === 0) throw new Error("division by zero"); return a / b; }\nmodule.exports = { divide };\n';
       fs.writeFileSync(path.join(project, 'math.js'), math);
@@ -485,7 +515,6 @@ const v04Cases: Case[] = [
           s.tool('test', 'bash', 'completed', { command: 'node test.js' }, { output, metadata: { exit: 0 } });
           s.text('done-edit', 'Guard added and tests passed.', 'edit-message'); s.idle();
         },
-        async (s) => { s.assistant('follow-up'); s.text('answer-followup', 'The guard rejects a zero divisor.', 'follow-up'); s.idle(); },
       ];
       const originalModels = launcher.models;
       const originalCreate = launcher.createAdapter;
@@ -494,6 +523,8 @@ const v04Cases: Case[] = [
       launcher.models = async () => [{ id: 'qwen3:8b', label: 'qwen3:8b', compatible: true }];
       launcher.createAdapter = (selection, _model, resumeSessionId) => new OpenCodeAdapter({ resumeSessionId, connector: async () => resumeSessionId ? restored : fake, launch: { executable: 'fixture', homeDir: project, ollamaBaseUrl: 'http://127.0.0.1:1', model: selection.model, contextLimit: 8192, outputLimit: 2048, profile: 'approved-write' } });
       try {
+        await setReviewer('endpoint', await ollama.start());
+        await reviewer.refreshModels();
         const id = (await launcher.start({ provider: 'local', model: 'qwen3:8b', profile: 'approved-write', workspaceRoot: project, instructions: 'Explain divide' }))!;
         controls.selectTask(id);
         await vscode.commands.executeCommand('visualAgent.openConversations', id);
@@ -501,10 +532,15 @@ const v04Cases: Case[] = [
         assert.equal(controls.getViewModel().header.statusKind, 'idle');
         assert.ok(vscode.window.tabGroups.all.some((g) => g.tabs.some((t) => t.input instanceof vscode.TabInputWebview && /conversations/i.test(t.input.viewType))));
         assert.equal(recorder.getTask(id)!.turns![0].status, 'Completed');
-        await launcher.send(id, 'Add a zero-divisor guard and run tests.');
+        await ConversationPanel.receive({ type: 'send', taskId: id, text: 'Add a zero-divisor guard and run tests.', attachments: [{ name: 'requirements.md', data: Buffer.from('Reject zero divisors; preserve exports.').toString('base64') }] });
+        assert.match(fake.requests.filter((r) => r.route.endsWith('/prompt_async'))[1].body.parts[0].text, /Reject zero divisors; preserve exports/);
         const edit = await waitUntil(() => controller.getSnapshot().awaitingApprovalFor, 'edit approval');
         assert.equal(fs.readFileSync(path.join(project, 'math.js'), 'utf8'), math);
-        assert.ok(recorder.getOperation(edit)!.associatedChangeId);
+        const changeId = recorder.getOperation(edit)!.associatedChangeId;
+        assert.ok(changeId);
+        const proposedUri = vscode.Uri.from({ scheme: 'visual-agent-change', path: `/${changeId}/proposed/math.js` });
+        const proposed = await vscode.workspace.openTextDocument(proposedUri);
+        assert.equal(proposed.getText(), changed, 'the recorded proposal retains the complete modified snapshot');
         controller.approve(edit);
         const command = await waitUntil(() => { const pending = controller.getSnapshot().awaitingApprovalFor; return pending && pending !== edit ? pending : undefined; }, 'test approval');
         controller.approve(command);
@@ -513,15 +549,35 @@ const v04Cases: Case[] = [
         assert.match(execFileSync(process.execPath, ['test.js'], { cwd: project, encoding: 'utf8', windowsHide: true }), /passed/);
         const document = await vscode.workspace.openTextDocument(path.join(project, 'math.js'));
         await vscode.window.showTextDocument(document);
-        await vscode.commands.executeCommand('visualAgent.explainInConversation', id);
-        await waitUntil(() => controller.getSnapshot().awaitingInput, 'same-model function explanation');
-        assert.equal(fake.requests.filter((r) => r.route.endsWith('/prompt_async')).length, 3);
+        assert.equal(ollama.chatRequests.length, 0, 'no automatic local model requests');
+        await ConversationPanel.receive({ type: 'explain' });
+        assert.equal(reviewer.getState().current?.kind, 'explain');
+        assert.equal(ollama.chatRequests.length, 1);
+        assert.match(ollama.chatRequests[0].messages[1].content, /divide/);
+        await ConversationPanel.receive({ type: 'explain' });
+        assert.equal(ollama.chatRequests.length, 1, 'repeat explanation uses the cache');
+        ollama.respond = (request) => {
+          const line = /^\+\s+(\d+) \| .*throw new Error/m.exec(request.messages[1].content)?.[1];
+          return [JSON.stringify([{ file: 1, status: 'change', side: 'after', line: Number(line), quote: 'throw new Error', message: 'Rejects zero divisors.' }])];
+        };
+        const explainDiff = { type: 'localOperation', action: 'explainDiff', operationId: edit };
+        await ConversationPanel.receive(explainDiff);
+        assert.equal(ollama.chatRequests.length, 2);
+        assert.match(ollama.chatRequests[1].messages[1].content, /Recorded intent: Add a zero-divisor guard/);
+        // Explain Diff sends the diff hunk (removed and added line with their numbers), not both file versions.
+        assert.match(ollama.chatRequests[1].messages[1].content, /^\+ +1 \| function divide\(a, b\) \{ if \(b === 0\) throw new Error/m);
+        assert.match(ollama.chatRequests[1].messages[1].content, /^- 1 +\| function divide\(a, b\) \{ return a \/ b; \}$/m);
+        assert.equal(ollama.chatRequests[1].options.num_predict > 0, true, 'the answer length is capped');
+        assert.match(reviewer.getState().current!.text, /Rejects zero divisors/);
+        await ConversationPanel.receive(explainDiff);
+        assert.equal(ollama.chatRequests.length, 2, 'repeat diff explanation uses the cache');
+        assert.equal(fake.requests.filter((r) => r.route.endsWith('/prompt_async')).length, 2, 'no extra agent turn');
         await controller.endSession(); await controller.whenIdle();
         const count = recorder.getTasks().length;
         await launcher.send(id, 'What did we change?');
         await waitUntil(() => controller.getSnapshot().awaitingInput, 'native session restored');
         assert.equal(recorder.getTasks().length, count);
-        assert.equal(recorder.getTask(id)!.turns!.length, 4);
+        assert.equal(recorder.getTask(id)!.turns!.length, 3);
         assert.ok(restored.requests.some((r) => r.method === 'GET' && r.route === `/session/${fake.sessionId}`));
         assert.equal(restored.requests.filter((r) => r.method === 'POST' && r.route === '/session').length, 0);
         const second = new FakeOpenCode(); second.directory = project; second.sessionId = 'ses_second';
@@ -535,11 +591,13 @@ const v04Cases: Case[] = [
         await launcher.send(id, 'Return to the first conversation');
         await waitUntil(() => controller.getSnapshot().taskId === id && controller.getSnapshot().awaitingInput, 'switch back to first session');
         assert.equal(recorder.getTask(secondId)!.status, 'Completed');
-        assert.equal(recorder.getTask(id)!.turns!.length, 5);
+        assert.equal(recorder.getTask(id)!.turns!.length, 4);
         await controller.endSession(); await controller.whenIdle();
       } finally {
         if (controller.isActive) { controller.stop(); await controller.whenIdle(); }
         launcher.models = originalModels; launcher.createAdapter = originalCreate;
+        await setReviewer('endpoint', previousEndpoint);
+        await ollama.stop();
         await vscode.commands.executeCommand('workbench.action.closeAllEditors');
         if (!process.env.VAW_TEST_TEMP_DIR) fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
@@ -561,10 +619,15 @@ const v04Cases: Case[] = [
         });
         for (const { project, op } of [entries[1], entries[0], entries[1]]) {
           controls.selectOperation(op.operationId, { reveal: true });
-          await waitUntil(() => {
-            const file = vscode.window.activeTextEditor?.document.uri.fsPath;
-            return !!file && path.relative(project, file) === 'same.js';
-          }, `navigation to ${project}`);
+          try {
+            await waitUntil(() => {
+              const file = vscode.window.activeTextEditor?.document.uri.fsPath;
+              return !!file && path.relative(project, file) === 'same.js';
+            }, `navigation to ${project}`);
+          } catch (error) {
+            console.error('Navigation diagnostics:', JSON.stringify({ project, active: vscode.window.activeTextEditor?.document.uri.toString(), visible: vscode.window.visibleTextEditors.map((e) => e.document.uri.toString()), selected: controls.getViewModel().selected?.id }));
+            throw error;
+          }
           assert.equal(controls.getViewModel().header.workspaceRoot, project);
         }
       } finally {
@@ -695,7 +758,7 @@ const v05Cases: Case[] = [
         assert.notEqual(editor.viewColumn, panelColumn, 'opened in another editor group');
         assert.ok(
           vscode.window.tabGroups.all.some((g) => g.activeTab?.input instanceof vscode.TabInputWebview && /conversations/.test((g.activeTab.input as vscode.TabInputWebview).viewType)),
-          'the conversation stays visible',
+          `the conversation stays visible: ${JSON.stringify(vscode.window.tabGroups.all.map((g) => ({ col: g.viewColumn, active: g.activeTab?.label, tabs: g.tabs.map((t) => t.label) })))}`,
         );
 
         // Relative path resolved against the conversation's project, with line AND column.
@@ -1052,10 +1115,14 @@ const v06Cases: Case[] = [
         fs.writeFileSync(conv.file, ORIG);
         const doc = await vscode.workspace.openTextDocument(conv.file);
         await vscode.window.showTextDocument(doc);
+        // Follow may already have the file open: let VS Code reload it from disk first, or the reload replaces the edit.
+        await waitUntil(() => doc.getText() === ORIG, 'open document reloaded from disk');
         const we = new vscode.WorkspaceEdit();
         we.insert(doc.uri, new vscode.Position(0, 0), '// unsaved\n');
-        await vscode.workspace.applyEdit(we);
-        assert.equal((await controls.proposals.check(p1)).files[0].reason, 'unsaved');
+        assert.ok(await vscode.workspace.applyEdit(we), 'edit applied');
+        await waitUntil(() => doc.isDirty, 'document has unsaved edits');
+        const unsavedCheck = await controls.proposals.check(p1);
+        assert.equal(unsavedCheck.files[0].reason, 'unsaved', `diagnostics: ${JSON.stringify({ files: unsavedCheck.files, docDirty: doc.isDirty, docUri: doc.uri.toString(), open: vscode.workspace.textDocuments.filter((d) => d.uri.scheme === 'file' && /math.js$/.test(d.uri.fsPath)).map((d) => [d.uri.toString(), d.isDirty]) })}`);
         await vscode.commands.executeCommand('workbench.action.files.revert');
         assert.equal((await controls.proposals.check(p1)).ok, true);
         await vscode.commands.executeCommand('visualAgent.approve');
@@ -1297,6 +1364,367 @@ const v07Cases: Case[] = [
   ],
 ];
 
+// ------------------------------------------- multi-file edit before applying
+
+
+const sessionCases: Case[] = [
+  [
+    'native continuity: follow-ups are turns of one Codex thread; change notes for edited files; two conversations stay isolated; switching back resumes the own thread; another provider\'s session is never reused',
+    async (api) => {
+      const { controller, recorder, launcher, sessions } = api;
+      const project = fs.mkdtempSync(path.join(process.env.VAW_TEST_TEMP_DIR || os.tmpdir(), 'vaw-cont-'));
+      fs.writeFileSync(path.join(project, 'math.js'), ORIG);
+      // Every adapter gets its own fake app-server with its own thread id; creation arguments are recorded.
+      const created: Array<{ resume?: string; reason?: string; server: FakeCodexServer }> = [];
+      let threads = 0;
+      const originalModels = launcher.models;
+      const originalCreate = launcher.createAdapter;
+      launcher.models = async () => [{ id: 'fake-model', label: 'fake-model', compatible: true }];
+      launcher.createAdapter = (_sel, _m, resumeSessionId, _claude, continuation) => {
+        const server = new FakeCodexServer();
+        server.threadId = `thr-${++threads}`;
+        server.handlers['thread/resume'] = (p) => ({ thread: { id: p.threadId }, model: 'fake-model', cwd: project, approvalPolicy: p.approvalPolicy, sandbox: { type: 'readOnly' } });
+        let turn = 0;
+        server.handlers['turn/start'] = () => {
+          server.turnId = `t${++turn}`;
+          setTimeout(() => {
+            if (turn === 1 && !resumeSessionId) {
+              const read = [{ type: 'read', command: 'Get-Content math.js', name: 'math.js', path: 'math.js' }];
+              server.itemStarted(commandItem(project, { id: `r${threads}`, commandActions: read }));
+              server.itemCompleted(commandItem(project, { id: `r${threads}`, status: 'completed', exitCode: 0, aggregatedOutput: ORIG, commandActions: read }));
+            }
+            server.itemCompleted({ type: 'agentMessage', id: `m${turn}`, text: `ok ${turn}` });
+            server.completeTurn('completed');
+          }, 0);
+          return { turn: { id: server.turnId, status: 'inProgress', items: [], error: null } };
+        };
+        created.push({ resume: resumeSessionId, reason: continuation?.reason, server });
+        return new CodexAppServerAdapter({ connector: () => new CodexRpcClient(server), profile: getProfile('approve-edits'), model: 'fake-model', resumeThreadId: resumeSessionId, reconstructedContext: continuation?.reconstructedContext, reconstructedReason: resumeSessionId ? undefined : continuation?.reason });
+      };
+      const turnTexts = (s: FakeCodexServer) => s.received.filter((m) => m.method === 'turn/start').map((m) => String(m.params.input[0].text));
+      try {
+        // Conversation A: three messages, one native thread.
+        const a = (await launcher.start({ provider: 'codex', model: 'fake-model', profile: 'approve-edits', workspaceRoot: project, instructions: 'Inspect divide in math.js' }))!;
+        await waitUntil(() => controller.getSnapshot().awaitingInput, 'A turn 1');
+        assert.equal(await launcher.send(a, 'Make divide throw on zero'), true);
+        await waitUntil(() => controller.getSnapshot().awaitingInput && turnTexts(created[0].server).length === 2, 'A turn 2');
+        // The user edits math.js between turns → the next message tells the agent to re-read exactly that file.
+        fs.writeFileSync(path.join(project, 'math.js'), ORIG + '// edited by the user\n');
+        assert.equal(await launcher.send(a, 'Why did you change it that way?'), true);
+        await waitUntil(() => controller.getSnapshot().awaitingInput && turnTexts(created[0].server).length === 3, 'A turn 3');
+        const textsA = turnTexts(created[0].server);
+        assert.equal(created.length, 1, 'no new adapter/process for follow-ups');
+        assert.equal(created[0].server.sentMethods().filter((m) => m === 'thread/start').length, 1, 'one thread for three messages');
+        assert.equal(textsA[1], 'Make divide throw on zero', 'Test B: nothing changed → the follow-up is sent as typed (no replay, no re-read request)');
+        assert.match(textsA[2], /^\[Context update from the editor: .*math\.js \(modified\).*\]\n\nWhy did you change it that way\?$/s, 'Test C: the changed file is named');
+        assert.ok(!recorder.getTask(a)!.messages!.some((m) => m.text.includes('Context update')), 'the note is not shown as the user\'s message');
+        const threadA = recorder.getTask(a)!.session!.id;
+        assert.equal(threadA, 'thr-1');
+        assert.deepEqual(sessions.metrics(a).nativeTurns, 2);
+
+        // Conversation B in the same workspace: its own thread; A's session is ended (not merged).
+        const b = (await launcher.start({ provider: 'codex', model: 'fake-model', profile: 'approve-edits', workspaceRoot: project, instructions: 'Explain validation' }))!;
+        await waitUntil(() => controller.getSnapshot().awaitingInput && controller.getSnapshot().taskId === b, 'B turn 1');
+        assert.equal(created.length, 2);
+        assert.equal(created[1].resume, undefined, 'a new conversation never resumes another conversation\'s thread');
+        assert.equal(recorder.getTask(b)!.session!.id, 'thr-2');
+        assert.notEqual(recorder.getTask(b)!.session!.id, threadA);
+        assert.ok(!turnTexts(created[1].server)[0].includes('Inspect divide'), 'no history of A in B');
+
+        // Back to A (as after a reload: a new process): resumes A's own thread natively.
+        assert.equal(await launcher.send(a, 'Summarise the change in one line'), true);
+        await waitUntil(() => controller.getSnapshot().awaitingInput && controller.getSnapshot().taskId === a, 'A resumed');
+        assert.equal(created[2].resume, threadA);
+        assert.deepEqual(created[2].server.sentMethods().filter((m) => m.startsWith('thread/')), ['thread/resume']);
+        assert.deepEqual(turnTexts(created[2].server), ['Summarise the change in one line'], 'native resume: no saved-conversation replay');
+        assert.equal(recorder.getTask(a)!.session!.continuity, 'resumed');
+        assert.equal(recorder.getTask(b)!.session!.id, 'thr-2', 'B untouched');
+
+        // Persisted with the history (survives a window reload).
+        const saved = recorder.exportHistory().tasks.find((t) => t.taskId === a)!;
+        assert.equal(saved.session?.id, threadA);
+
+        // A session recorded by another provider is never reused for Codex.
+        await controller.endSession();
+        await controller.whenIdle();
+        recorder.setSession(a, { provider: 'local', id: 'ses_from_opencode' });
+        assert.equal(await launcher.send(a, 'Continue'), true);
+        await waitUntil(() => controller.getSnapshot().awaitingInput && created.length === 4, 'A with a foreign session');
+        assert.equal(created[3].resume, undefined);
+        assert.match(created[3].reason!, /belongs to local/);
+        assert.match(turnTexts(created[3].server)[0], /^\[Reconstructed context: the previous native session could not be continued \(the recorded session belongs to local\)/);
+        assert.equal(recorder.getTask(a)!.session!.continuity, 'reconstructed');
+        await controller.endSession();
+        await controller.whenIdle();
+      } finally {
+        launcher.models = originalModels;
+        launcher.createAdapter = originalCreate;
+        if (controller.isActive) {
+          controller.stop();
+          await controller.whenIdle();
+        }
+        if (!process.env.VAW_TEST_TEMP_DIR) fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      }
+    },
+  ],
+];
+
+const approvalSyncCases: Case[] = [
+  [
+    'approval sync: the notification closes when the proposal is decided in any panel; repeated decisions reach the agent once; stop closes it too',
+    async (api) => {
+      const { controller, recorder, controls } = api;
+      const replies: string[] = [];
+      let conv: Awaited<ReturnType<typeof fakeLocalConversation>> | undefined;
+      conv = await fakeLocalConversation(api, [
+        async (s) => {
+          s.assistant('m1');
+          editTool(s, 'e1', conv!.file, 'return a / b;', 'if (b === 0) throw new Error("zero");\n  return a / b;');
+          replies.push(await s.permission('p1', 'edit', 'e1', { filepath: conv!.file }));
+          fs.writeFileSync(conv!.file, GUARDED);
+          s.tool('e1', 'edit', 'completed', { filePath: conv!.file, oldString: 'x', newString: 'y' });
+          s.tool('b2', 'bash', 'running', { command: 'node --version', workdir: conv!.project });
+          replies.push(await s.permission('p2', 'bash', 'b2', { command: 'node --version' }));
+          s.tool('b2', 'bash', 'error', { command: 'node --version' }, { error: 'rejected' });
+          editTool(s, 'e3', conv!.file, 'module.exports = { divide };', 'module.exports = { divide, v: 1 };');
+          replies.push(await s.permission('p3', 'edit', 'e3', { filepath: conv!.file }));
+          s.idle();
+        },
+      ]);
+      try {
+        await api.launcher.send(conv.id, 'Guard divide');
+        await vscode.commands.executeCommand('visualAgent.openConversations', conv.id);
+        // 1. Approved in the Conversation panel → the notification closes; Activity shows it decided.
+        const p1 = await waitUntil(() => controller.getSnapshot().awaitingApprovalFor, 'proposal 1');
+        await waitUntil(() => controls.openApprovalNotices().includes(p1), 'approval notification shown');
+        await controls.runAction('review', p1); // the diff must have been seen before approving
+        await ConversationPanel.receive({ type: 'action', action: 'approve', operationId: p1 });
+        await waitUntil(() => replies.length === 1, 'agent got the approval');
+        assert.equal(replies[0], 'once');
+        await waitUntil(() => !controls.openApprovalNotices().includes(p1), 'notification closed after approval in the Conversation panel');
+        assert.ok(!controls.getViewModel().operations.find((o) => o.id === p1)?.awaitingApproval, 'Agent Activity: no longer awaiting');
+        // Repeated approvals (double click, the other panel, the command) are ignored without warnings and never reach the agent twice.
+        await ConversationPanel.receive({ type: 'action', action: 'approve', operationId: p1 });
+        await controls.runAction('approve', p1);
+        await vscode.commands.executeCommand('visualAgent.approve', p1);
+        // 2. A command decided from the Agent Activity path (controller) → its notification closes too.
+        const p2 = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== p1 ? id : undefined; }, 'proposal 2');
+        await waitUntil(() => controls.openApprovalNotices().includes(p2), 'second notification');
+        assert.ok(controller.reject(p2, 'not now'));
+        await waitUntil(() => replies.length === 2, 'agent got the rejection');
+        assert.deepEqual(replies, ['once', 'reject'], 'each decision reached the agent exactly once');
+        await waitUntil(() => !controls.openApprovalNotices().includes(p2), 'notification closed after rejection');
+        // 3. Stopping the task closes the notification of a pending proposal.
+        const p3 = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== p2 && id !== p1 ? id : undefined; }, 'proposal 3');
+        await waitUntil(() => controls.openApprovalNotices().includes(p3), 'third notification');
+        controller.stop();
+        await controller.whenIdle();
+        await waitUntil(() => controls.openApprovalNotices().length === 0, 'notification closed on stop');
+        assert.equal(recorder.getOperation(p3)!.status, 'Cancelled');
+      } finally {
+        await conv.cleanup();
+      }
+    },
+  ],
+];
+
+const multiFileCases: Case[] = [
+  [
+    'multi-file edit before applying: file list, switching keeps edits, reset, combined diff, conflict blocks, failed write rolls back, cancel, then normal approval',
+    async (api) => {
+      const { controller, recorder, controls, launcher } = api;
+      const project = fs.mkdtempSync(path.join(process.env.VAW_TEST_TEMP_DIR || os.tmpdir(), 'vaw-multi-'));
+      const file = (rel: string) => path.join(project, rel);
+      const read = (rel: string) => (fs.existsSync(file(rel)) ? fs.readFileSync(file(rel), 'utf8') : undefined);
+      const A = 'export const a = 1;\n', B = 'export const b = 1;\n', OLD = 'legacy();\n', KEEP = 'keep();\n';
+      fs.writeFileSync(file('keep.js'), KEEP);
+      fs.writeFileSync(file('a.js'), A);
+      fs.writeFileSync(file('b.js'), B);
+      fs.writeFileSync(file('old.js'), OLD);
+      const agent = new MultiFileAgent(project, [
+        [
+          { rel: 'a.js', kind: 'update', after: (s) => s.replace('= 1', '= 2') },
+          { rel: 'b.js', kind: 'update', after: (s) => s.replace('= 1', '= 2') },
+          { rel: 'c.js', kind: 'add', after: () => 'export const c = 3;\n' },
+          { rel: 'old.js', kind: 'delete' },
+          { rel: 'keep.js', kind: 'delete' },
+        ],
+        [
+          // A stale proposal: reverts the user's applied a.js and deletes the file the user kept.
+          { rel: 'a.js', kind: 'update', after: () => 'export const a = 2;\n' },
+          { rel: 'keep.js', kind: 'delete' },
+        ],
+        [
+          { rel: 'a.js', kind: 'update', after: (s) => s + '// p2\n' },
+          { rel: 'b.js', kind: 'update', after: (s) => s + '// p2\n' },
+        ],
+        [
+          { rel: 'a.js', kind: 'update', after: (s) => s + '// p3\n' },
+          { rel: 'b.js', kind: 'update', after: (s) => s + '// p3\n' },
+        ],
+      ]);
+      const originalModels = launcher.models;
+      const originalCreate = launcher.createAdapter;
+      const originalStore = controls.proposals.fileStore;
+      launcher.models = async () => [{ id: 'qwen3:8b', label: 'qwen3:8b', compatible: true }];
+      launcher.createAdapter = () => agent;
+      const copies = (op: string) => vscode.workspace.textDocuments.filter((d) => d.uri.fsPath.includes(path.join('proposals', op)));
+      const setDoc = async (doc: vscode.TextDocument, text: string) => {
+        const we = new vscode.WorkspaceEdit();
+        we.replace(doc.uri, new vscode.Range(0, 0, doc.lineCount, 0), text);
+        await vscode.workspace.applyEdit(we);
+      };
+      try {
+        const taskId = (await launcher.start({ provider: 'local', model: 'qwen3:8b', profile: 'approved-write', workspaceRoot: project, instructions: 'Rename constants' }))!;
+        const p1 = await waitUntil(() => controller.getSnapshot().awaitingApprovalFor, 'multi-file proposal');
+        assert.equal(recorder.getOperation(p1)!.associatedChangeIds?.length, 5);
+
+        // 1. All files in a selectable list; nothing written.
+        await controls.runAction('editProposal', p1);
+        const state = () => controls.proposals.editState(p1)!;
+        await waitUntil(() => controls.proposals.isEditing(p1), 'editing');
+        assert.equal(state().multi, true);
+        assert.deepEqual(state().files.map((f) => [f.rel, f.kind, f.editable]), [['a.js', 'update', true], ['b.js', 'update', true], ['c.js', 'add', true], ['old.js', 'delete', false], ['keep.js', 'delete', false]]);
+        assert.deepEqual([read('a.js'), read('b.js'), read('c.js'), read('old.js')], [A, B, undefined, OLD], 'nothing written yet');
+
+        // 2./3. Edit a.js, switch to b.js and edit it: a.js keeps the user's text.
+        const aDoc = await waitUntil(() => copies(p1).find((d) => d.uri.fsPath.endsWith('a.js')), 'a.js copy');
+        assert.equal(aDoc.getText(), 'export const a = 2;\n', 'the copy starts as the proposed version');
+        await setDoc(aDoc, 'export const a = 42; // mine\n');
+        await controls.proposals.editBeforeApplying(p1, 1);
+        await waitUntil(() => state().files[1].active, 'switched to b.js');
+        assert.equal(state().files[0].edited, true, 'a.js edit kept after switching');
+        assert.equal(fs.readFileSync(aDoc.uri.fsPath, 'utf8'), 'export const a = 42; // mine\n', 'the copy was saved when switching');
+        const bDoc = await waitUntil(() => copies(p1).find((d) => d.uri.fsPath.endsWith('b.js')), 'b.js copy');
+        await setDoc(bDoc, 'export const b = 99;\n');
+        await waitUntil(() => state().files[1].edited, 'b.js edited');
+        // 4. Reset b.js only.
+        await controls.proposals.resetEditFile(p1, 1);
+        assert.equal(bDoc.getText(), 'export const b = 2;\n');
+        assert.deepEqual(state().files.map((f) => f.edited), [true, false, false, false, false], 'reset one file; the others keep their edits');
+        // Exclude one proposed deletion (keep.js) without rejecting the proposal.
+        await controls.proposals.setDeletionExcluded(p1, 4, true);
+        assert.deepEqual(state().files.map((f) => f.excluded), [false, false, false, false, true]);
+        await assert.rejects(controls.proposals.setDeletionExcluded(p1, 0, true), /Only proposed deletions can be excluded/);
+        // Edit the new file too, after switching back and forth.
+        await controls.proposals.editBeforeApplying(p1, 2);
+        const cDoc = await waitUntil(() => copies(p1).find((d) => d.uri.fsPath.endsWith('c.js')), 'c.js copy');
+        await setDoc(cDoc, 'export const c = 33;\n');
+        await controls.proposals.editBeforeApplying(p1, 0);
+        assert.equal(aDoc.getText(), 'export const a = 42; // mine\n');
+
+        // 5./6. The first apply only shows the combined diff; nothing is written.
+        assert.equal(await controls.proposals.applyEditedVersion(p1), false);
+        const preview = await waitUntil(() => vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'visual-agent-edit-preview' && d.uri.path.startsWith(`/${p1}/`)), 'combined diff');
+        const combined = preview.getText();
+        assert.match(combined, /4 of 5 file\(s\)[\s\S]*1 deletion\(s\) excluded/);
+        assert.match(combined, /keep\.js\n\(deletion excluded by you: the file is kept unchanged\)/);
+        assert.match(combined, /a\.js \(edited by you\)[\s\S]*\+export const a = 42; \/\/ mine/);
+        assert.match(combined, /\+export const b = 2;/);
+        assert.match(combined, /new file[\s\S]*\+export const c = 33;/);
+        assert.match(combined, /deleted file[\s\S]*-legacy\(\);/);
+        assert.equal(state().previewed, true);
+        assert.deepEqual([read('a.js'), read('b.js'), read('c.js'), read('old.js')], [A, B, undefined, OLD], 'previewing writes nothing');
+        assert.equal(agent.replies.length, 0, 'the agent is still waiting');
+
+        // 7. Conflict: b.js changed on disk after the proposal → nothing is written.
+        fs.writeFileSync(file('b.js'), B + '// someone else\n');
+        await assert.rejects(controls.proposals.applyEditedVersion(p1), /Not applied: b\.js changed on disk[\s\S]*Nothing was written/);
+        assert.deepEqual([read('a.js'), read('c.js'), read('old.js')], [A, undefined, OLD]);
+        fs.writeFileSync(file('b.js'), B);
+
+        // 8. A write fails half-way → the files already written are restored.
+        controls.proposals.fileStore = { ...originalStore, write: async (abs, text) => { if (abs.endsWith('c.js')) throw new Error('disk full (injected)'); await originalStore.write(abs, text); } };
+        await assert.rejects(controls.proposals.applyEditedVersion(p1), /writing c\.js failed \(disk full \(injected\)\)[\s\S]*restored to its previous content/);
+        controls.proposals.fileStore = originalStore;
+        assert.deepEqual([read('a.js'), read('b.js'), read('c.js'), read('old.js')], [A, B, undefined, OLD], 'no partial application');
+        assert.match(recorder.getOperation(p1)!.history.map((h) => h.note).join(' '), /Your version was not applied: writing c\.js failed/);
+        assert.equal(controls.proposals.isEditing(p1), true, 'the edits survive a failed apply');
+
+        // Content changed since the preview → the combined diff is shown again first.
+        await setDoc(aDoc, 'export const a = 43; // mine\n');
+        assert.equal(await controls.proposals.applyEditedVersion(p1), false, 'changed since the preview: show it again');
+        await waitUntil(() => /a = 43/.test(preview.getText()), 'the combined diff refreshed with the new content');
+        assert.equal(read('a.js'), A);
+        // Explicit approval of exactly what was previewed.
+        assert.equal(await controls.proposals.applyEditedVersion(p1), true);
+        await waitUntil(() => agent.replies.length === 1, 'agent write declined');
+        assert.deepEqual([read('a.js'), read('b.js'), read('c.js'), read('old.js'), read('keep.js')], ['export const a = 43; // mine\n', 'export const b = 2;\n', 'export const c = 33;\n', undefined, KEEP], 'keep.js kept: its deletion was excluded');
+        assert.equal(agent.replies[0].decision, 'rejected');
+        assert.match(agent.replies[0].reason!, /edited version of the 5 files: a\.js \(\+1 −1, edited by the user\); b\.js \(\+1 −1\); c\.js \(\+1 −0, edited by the user\); old\.js \(deleted as proposed\); keep\.js \(your deletion was NOT applied: the user kept this file; do not delete it\)[\s\S]*do not delete the kept files[\s\S]*Read the latest version of these files/);
+        const userOp = recorder.getOperations(taskId).find((o) => o.source === 'user' && o.operationType === 'Edit')!;
+        assert.equal(userOp.status, 'Completed');
+        assert.equal(userOp.associatedChangeIds?.length, 4);
+        assert.match(userOp.description, /You applied your edited version of 4 files \(a\.js, b\.js, c\.js, old\.js; \+3 −3 vs original\); kept keep\.js \(deletion excluded\)/);
+        const copyTabs = (op: string) => vscode.window.tabGroups.all.flatMap((g) => g.tabs).filter((t) => t.input instanceof vscode.TabInputTextDiff && t.input.modified.fsPath.includes(path.join('proposals', op)));
+        await waitUntil(() => !copyTabs(p1).length, 'editable copy tabs closed');
+        assert.ok(!fs.existsSync(path.dirname(path.dirname(aDoc.uri.fsPath))), 'editable copies deleted');
+
+        // The agent cannot overwrite what the user applied: a stale proposal that reverts the user's a.js
+        // and deletes the kept keep.js is blocked BEFORE it is written (b.js, applied unedited, is not protected).
+        const stale = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== p1 ? id : undefined; }, 'stale proposal');
+        const cs = await controls.proposals.check(stale);
+        assert.deepEqual(cs.files.map((f) => [f.rel, f.reason]), [['a.js', 'undoes-manual'], ['keep.js', 'undoes-manual']]);
+        assert.match(controls.proposals.describe(cs), /a\.js would undo your manual edits \(near line 1: export const a = 43; \/\/ mine\); keep\.js would undo your manual edits \(near line 1: \(the user chose to keep keep\.js/);
+        for (let i = 0; i < 3; i++) await controls.runAction('approve', stale);
+        await new Promise((r) => setTimeout(r, 300));
+        assert.equal(agent.replies.length, 1, 'the stale proposal was NOT approved');
+        assert.deepEqual([read('a.js'), read('keep.js')], ['export const a = 43; // mine\n', KEEP]);
+        assert.match(recorder.getOperation(stale)!.history.map((h) => h.note).join(' '), /Approval blocked: a\.js would undo your manual edits/);
+        await assert.rejects(controls.proposals.editBeforeApplying(stale), /Cannot edit: a\.js would undo your manual edits/);
+        assert.ok(controller.reject(stale, 'keep my version'));
+        await waitUntil(() => agent.replies.length === 2, 'stale proposal rejected');
+
+        // 9. Cancel editing: nothing written, the proposal stays pending; then normal approval still works.
+        const p2 = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== p1 && id !== stale ? id : undefined; }, 'proposal 2');
+        const before2 = [read('a.js'), read('b.js')];
+        await controls.proposals.editBeforeApplying(p2);
+        const a2 = await waitUntil(() => copies(p2).find((d) => d.uri.fsPath.endsWith('a.js')), 'p2 copy');
+        await setDoc(a2, 'garbage\n');
+        await controls.runAction('cancelEdit', p2);
+        assert.equal(controls.proposals.isEditing(p2), false);
+        assert.ok(controller.getSnapshot().pendingApprovals.includes(p2), 'still awaiting a decision');
+        assert.deepEqual([read('a.js'), read('b.js')], before2);
+        assert.ok(!fs.existsSync(path.dirname(path.dirname(a2.uri.fsPath))), 'copies removed');
+        for (let i = 0; i < 4 && agent.replies.length < 3; i++) {
+          await controls.runAction('approve', p2); // the first call opens the unseen diffs
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        await waitUntil(() => agent.replies.length === 3, 'p2 approved');
+        assert.equal(agent.replies[2].decision, 'approved');
+        assert.deepEqual([read('a.js'), read('b.js')], before2.map((t) => t + '// p2\n'), 'the agent applied its own patch after approval');
+
+        // 10. Stopping closes clean copies and leaves unsaved drafts available.
+        const p3 = await waitUntil(() => { const id = controller.getSnapshot().awaitingApprovalFor; return id && id !== p2 ? id : undefined; }, 'proposal 3');
+        const before3 = [read('a.js'), read('b.js')];
+        await controls.proposals.editBeforeApplying(p3);
+        const a3 = await waitUntil(() => copies(p3).find((d) => d.uri.fsPath.endsWith('a.js')), 'p3 copy');
+        await setDoc(a3, 'unsaved draft\n');
+        controller.stop();
+        await controller.whenIdle();
+        await waitUntil(() => !controls.proposals.isEditing(p3) && copyTabs(p3).length === 1, 'only the dirty draft remains open');
+        assert.equal(a3.isDirty, true);
+        assert.equal(a3.getText(), 'unsaved draft\n');
+        assert.ok(fs.existsSync(a3.uri.fsPath), 'draft backing file retained');
+        assert.deepEqual([read('a.js'), read('b.js')], before3);
+        assert.equal(agent.replies[3].decision, 'cancelled');
+        assert.equal(recorder.getOperations(taskId).filter((o) => o.source === 'user').length, 1, 'only the one applied user version is recorded');
+        await a3.save();
+      } finally {
+        controls.proposals.fileStore = originalStore;
+        launcher.models = originalModels;
+        launcher.createAdapter = originalCreate;
+        if (controller.isActive) {
+          controller.stop();
+          await controller.whenIdle();
+        }
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+        if (!process.env.VAW_TEST_TEMP_DIR) fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      }
+    },
+  ],
+];
+
 export async function run(): Promise<void> {
   const ext = vscode.extensions.all.find((e) => e.packageJSON?.name === 'visual-agent-workspace');
   assert.ok(ext, 'extension found');
@@ -1304,7 +1732,7 @@ export async function run(): Promise<void> {
   await vscode.workspace.getConfiguration('visualAgent').update('stepDelayMs', 0, vscode.ConfigurationTarget.Global);
 
   let failed = 0;
-  for (const [name, fn] of [...cases, ...v03Cases, ...i18nCases, ...v04Cases, ...v05Cases, ...v05ExplainCases, ...v06Cases, ...v07Cases]) {
+  for (const [name, fn] of [...cases, ...v03Cases, ...i18nCases, ...v04Cases, ...v05Cases, ...v05ExplainCases, ...v06Cases, ...v07Cases, ...sessionCases, ...approvalSyncCases, ...multiFileCases]) {
     try {
       await fn(api);
       console.log(`  ✔ ${name}`);
@@ -1317,7 +1745,7 @@ export async function run(): Promise<void> {
       }
     }
   }
-  const total = cases.length + v03Cases.length + i18nCases.length + v04Cases.length + v05Cases.length + v05ExplainCases.length + v06Cases.length + v07Cases.length;
+  const total = cases.length + v03Cases.length + i18nCases.length + v04Cases.length + v05Cases.length + v05ExplainCases.length + v06Cases.length + v07Cases.length + sessionCases.length + approvalSyncCases.length + multiFileCases.length;
   console.log(`\n${total - failed}/${total} integration tests passed`);
   if (failed) {
     throw new Error(`${failed} integration test(s) failed`);

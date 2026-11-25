@@ -16,6 +16,14 @@ export class FakeOllama {
   chatRequests: any[] = [];
   requests: string[] = [];
   aborted = 0;
+  /** /api/show model_info.<arch>.context_length; undefined → /api/show answers 404 (metadata unavailable). */
+  contextLength?: number;
+  /** Return an error message to fail this chat request with HTTP 500. */
+  failWith?: (request: any) => string | undefined;
+  /** prompt_eval_count reported for a request (default 42). */
+  promptTokens?: (request: any) => number;
+  inFlight = 0;
+  maxInFlight = 0;
 
   constructor() {
     this.server = http.createServer((req, res) => void this.handle(req, res));
@@ -42,7 +50,16 @@ export class FakeOllama {
       res.end(JSON.stringify({ models: this.models.map((name) => ({ name, model: name, size: 1e9, details: { parameter_size: '8B', quantization_level: 'Q4_K_M', family: 'fake' } })) }));
       return;
     }
+    if (req.url === '/api/show' && req.method === 'POST') {
+      for await (const _ of req) { /* drain */ }
+      if (this.contextLength === undefined) { res.statusCode = 404; res.end('{}'); return; }
+      res.end(JSON.stringify({ model_info: { 'general.architecture': 'fake', 'fake.context_length': this.contextLength } }));
+      return;
+    }
     if (req.url === '/api/chat' && req.method === 'POST') {
+      this.inFlight++;
+      this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+      res.on('close', () => this.inFlight--);
       let body = '';
       for await (const c of req) {
         body += c;
@@ -52,6 +69,12 @@ export class FakeOllama {
       if (!this.models.includes(parsed.model)) {
         res.statusCode = 404;
         res.end(JSON.stringify({ error: `model "${parsed.model}" not found, try pulling it first` }));
+        return;
+      }
+      const failure = this.failWith?.(parsed);
+      if (failure) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: failure }));
         return;
       }
       res.setHeader('content-type', 'application/x-ndjson');
@@ -77,7 +100,7 @@ export class FakeOllama {
         await send({ model: parsed.model, message: { role: 'assistant', content: t }, done: false });
       }
       if (!closed) {
-        await send({ model: parsed.model, message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 42, eval_count: this.tokens.length, total_duration: 5e6 });
+        await send({ model: parsed.model, message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: this.promptTokens ? this.promptTokens(parsed) : 42, eval_count: this.tokens.length, total_duration: 5e6 });
         res.end();
       }
       return;

@@ -37,7 +37,7 @@ async function turn(c, recorder, taskId, repo, allowEdit = false) {
       const op = recorder.getOperation(id);
       if (allowEdit && op.operationType === 'Edit' && op.filePath === 'math.js') {
         assert.equal(fs.readFileSync(path.join(repo.dir, 'math.js'), 'utf8'), repo.before, 'file unchanged before approval');
-        assert.ok(op.associatedChangeId, 'edit has a reviewable diff');
+        assert.ok(op.associatedChangeId, `edit has a reviewable diff: ${JSON.stringify({ d: op.description, r: op.rationale, s: op.resultSummary })}`);
         c.approve(id);
       } else if (allowEdit && op.command && /^node\s+test\.js\s*$/.test(op.command.command.trim())) c.approve(id);
       else c.reject(id, 'Only the requested math.js edit and node test.js are allowed.');
@@ -72,7 +72,7 @@ async function turn(c, recorder, taskId, repo, allowEdit = false) {
     console.log('2. Edit, approve, and run tests');
     await current.controller.steer('Now edit math.js using the edit tool: make divide(a,b) throw new Error("division by zero") when b === 0. Use actual newline characters, not literal backslash-n. Then run node test.js once with bash and report the result. Do not change any other file.');
     await turn(current.controller, current.recorder, taskId, repo, true);
-    const test = current.recorder.getOperations(taskId).find((op) => op.command?.command.trim() === 'node test.js');
+    const test = current.recorder.getOperations(taskId).findLast((op) => op.command?.command.trim() === 'node test.js');
     assert.equal(test?.command?.exitCode, 0, 'real test succeeded');
     assert.match(execFileSync(process.execPath, ['test.js'], { cwd: repo.dir, encoding: 'utf8', windowsHide: true }), /all tests passed/);
     console.log('3. Follow-up in same session');
@@ -90,8 +90,18 @@ async function turn(c, recorder, taskId, repo, allowEdit = false) {
     assert.equal(current.recorder.getTask(taskId).session.id, sessionId);
     assert.equal(current.recorder.getTasks().length, 1, 'all turns remain in the same conversation');
     assert.equal(current.recorder.getTask(taskId).turns.length, 4);
+    assert.equal(current.recorder.getTask(taskId).session.continuity, 'resumed');
     await current.controller.endSession();
     await current.controller.whenIdle();
+    console.log('5. A session that no longer exists: the failure is reported, nothing is silently replaced or replayed');
+    current.recorder.dispose();
+    current = setup(repo, 'ses_doesnotexist000000000000');
+    current.controller.start('What was our session marker?', current.adapter, repo.dir, { taskId, userMessage: 'What was our session marker?' });
+    await current.controller.whenIdle();
+    const lostTask = current.recorder.getTask(taskId);
+    assert.equal(lostTask.session.id, sessionId, 'the recorded session is not overwritten');
+    assert.equal(lostTask.turns.at(-1).status, 'Failed', `turn result: ${lostTask.turns.at(-1).status}`);
+    console.log(`   reported: ${(lostTask.summary || lostTask.turns.at(-1).report || '').slice(0, 160)}`);
     const files = repo.status().split('\n').filter(Boolean);
     assert.deepEqual(files, ['M math.js']);
     const finalLoaded = await (await fetch(`${endpoint}/api/ps`)).json();

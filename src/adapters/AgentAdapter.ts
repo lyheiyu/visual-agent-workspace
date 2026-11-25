@@ -1,3 +1,4 @@
+import type { PromptAttachment } from '../agents/attachments';
 import { AffectedFunction, AgentOperation, AgentSourceId, ChangedRange, OperationType, TaskStatus } from '../types/events';
 
 /**
@@ -56,6 +57,7 @@ export interface AgentTaskContext {
   description: string;
   /** Absolute path of the workspace folder the agent operates in ('' if none). */
   workspaceRoot: string;
+  attachments?: PromptAttachment[];
 }
 
 export interface OperationRequest {
@@ -111,6 +113,8 @@ export interface AdapterCapabilities {
    * and "Send instruction" continues the SAME session. Ended with End session.
    */
   followUp?: boolean;
+  /** Multi-turn adapters that also accept instructions during a running turn (Codex `turn/steer`). */
+  steerWhileRunning?: boolean;
 }
 
 export interface StreamingRunResult {
@@ -165,8 +169,10 @@ export interface OperationSink {
   log(message: string): void;
   /** Multi-turn adapters: the agent finished its turn and waits for the user. */
   setAwaitingInput?(waiting: boolean): void;
-  /** Native provider session identity (not a credential). */
-  setSession?(session: { provider: 'local'; id: string }): void;
+  /** Native provider session identity (not a credential) and how this run continued it. */
+  setSession?(session: import('../types/events').NativeSession): void;
+  /** Token usage the provider reported for the latest turn (diagnostics only; never estimated). */
+  reportUsage?(usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; totalTokens?: number }): void;
   /** Display progress metadata only; never persist model reasoning text. */
   setProgress?(phase: 'thinking' | 'answering' | 'tool', characters: number): void;
   /**
@@ -189,7 +195,7 @@ export interface StreamingAgentAdapter {
   run(ctx: AgentTaskContext, sink: OperationSink, signal: AbortSignal): Promise<StreamingRunResult>;
   interrupt(): Promise<void>;
   /** Add an instruction to the active turn. Throws if no turn is active. */
-  steer?(text: string): Promise<void>;
+  steer?(text: string, attachments?: PromptAttachment[]): Promise<void>;
   /** Multi-turn adapters: finish the session gracefully (task completes). */
   endSession?(): Promise<void>;
   dispose?(): void;

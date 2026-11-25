@@ -40,17 +40,32 @@ function webview(brokenRenderer = false) {
   vm.runInContext(fs.readFileSync(path.join(media, 'conversation.js'), 'utf8'), context);
   return {
     nodes: () => all(app), sent, errors,
-    show(text: string) {
+    receive: (data: unknown) => receive({ data }),
+    show(text: string, overrides: Record<string, unknown> = {}) {
       receive({ data: { type: 'state', model: {
         strings: {}, taskId: 'saved-conversation', tasks: [],
         header: { statusLabel: 'Turn complete', statusKind: 'idle' },
         messages: [{ role: 'assistant', text, ast: parseMarkdown(text), timestamp: '2026-11-17T12:00:00Z' }],
         turns: [{ number: 1, status: 'Completed', report: text, ast: parseMarkdown(text) }],
-        approvals: [], canSend: true, mode: 'live',
+        approvals: [], canSend: true, mode: 'live', ...overrides,
       } } });
     },
   };
 }
+
+test('read-only conversations keep local actions available without sending a coding-agent turn', () => {
+  const view = webview();
+  view.show('Prior result', { reviewerEnabled: true, hasLocalOperations: true, canSend: false });
+  const click = (label: string) => view.nodes().find((node) => node.textContent === label)!.listeners.click();
+  click('chat.localOperations');
+  click('chat.explain');
+  click('r.impact');
+  assert.deepEqual(view.sent.slice(-3).map((item) => [item.type, item.impact]), [
+    ['localOperation', undefined], ['explain', undefined], ['explain', true],
+  ]);
+  view.show('Prior result', { reviewerEnabled: false, hasLocalOperations: true, canSend: false });
+  assert.ok(!view.nodes().some((node) => ['chat.localOperations', 'chat.explain', 'r.impact'].includes(node.textContent)));
+});
 
 test('saved conversations containing nested lists and blockquotes reopen with messages, results and composer', () => {
   const view = webview();
@@ -74,4 +89,16 @@ test('a formatting error falls back to original text without losing the composer
   assert.equal(view.sent.at(-1).type, 'send');
   assert.equal(view.sent.at(-1).text, 'Continue from here');
   assert.ok(view.errors.length > 0);
+});
+
+test('conversation attachments show image previews, support removal and attachment-only sending, and survive send errors', () => {
+  const view = webview(); view.show('Ready');
+  view.receive({ type: 'attachments', taskId: 'saved-conversation', attachments: [{ name: 'screen.png', mime: 'image/png', data: 'aW1hZ2U=' }] });
+  assert.ok(view.nodes().some((node) => node.tagName === 'img'));
+  view.nodes().find((node) => node.textContent === 'chat.send')!.listeners.click();
+  assert.equal(view.sent.at(-1).attachments[0].name, 'screen.png');
+  view.receive({ type: 'error', taskId: 'saved-conversation', message: 'Model unavailable' });
+  assert.ok(view.nodes().some((node) => node.tagName === 'img'), 'failed sends preserve attachments');
+  view.nodes().find((node) => node.textContent === '×')!.listeners.click();
+  assert.ok(!view.nodes().some((node) => node.tagName === 'img'));
 });

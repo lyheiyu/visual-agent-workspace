@@ -1,3 +1,4 @@
+import type { PromptAttachment } from '../agents/attachments';
 import { randomUUID } from 'node:crypto';
 import {
   AdapterCapabilities,
@@ -88,6 +89,9 @@ const MAX_INSTRUCTION_CHARS = 4000;
 export class AgentController {
   private readonly stateEmitter = new Emitter<ControllerSnapshot>();
   readonly onDidChangeState = this.stateEmitter.event;
+  private readonly sessionEmitter = new Emitter<SessionEvent>();
+  /** Native session lifecycle and provider-reported usage (diagnostics; no model calls). */
+  readonly onDidSessionEvent = this.sessionEmitter.event;
   private readonly changeEmitter = new Emitter<ProposedChangeContent>();
   /** Fired with full change content (for the review UI). Never persisted. */
   readonly onDidProposeChange = this.changeEmitter.event;
@@ -153,7 +157,7 @@ export class AgentController {
   // ------------------------------------------------------------- commands
 
   /** Start a task (with the default adapter unless one is given). Returns its ID. */
-  start(description: string, adapter?: AnyAgentAdapter, workspaceRoot?: string, continuation?: { taskId: string; userMessage: string }): string {
+  start(description: string, adapter?: AnyAgentAdapter, workspaceRoot?: string, continuation?: { taskId: string; userMessage: string; attachments?: PromptAttachment[] }): string {
     if (this.isActive) {
       throw new Error('A task is already running. Stop it before starting another.');
     }
@@ -185,6 +189,7 @@ export class AgentController {
     const ctx: AgentTaskContext = {
       taskId: task.taskId,
       description,
+      attachments: continuation?.attachments,
       workspaceRoot: workspaceRoot ?? this.options.workspaceRoot(),
     };
     this.emitState();
@@ -246,7 +251,11 @@ export class AgentController {
    * that support it). Recorded in the audit trail as an 'Instruct' operation.
    * Instructions cannot change sandbox or approval policy.
    */
-  async steer(text: string): Promise<AgentOperation> {
+  /**
+   * @param agentNote short context sent to the agent before the text (e.g. files changed since it read them);
+   *   recorded on the operation, not as the user's message.
+   */
+  async steer(text: string, attachments?: PromptAttachment[], agentNote = ''): Promise<AgentOperation> {
     const adapter = this.adapter;
     const trimmed = text.trim();
     if (!this.isActive || this.stopRequested || !this.taskId) {
@@ -255,7 +264,7 @@ export class AgentController {
     if (!isStreamingAdapter(adapter) || !adapter.capabilities.steer || !adapter.steer) {
       throw new Error(`${adapter.displayName} does not accept instructions during a task.`);
     }
-    if (adapter.capabilities.followUp && (!this.awaitingInput || this.pendingDecisions.size)) {
+    if (adapter.capabilities.followUp && !(adapter.capabilities.steerWhileRunning && !this.awaitingInput) && (!this.awaitingInput || this.pendingDecisions.size)) {
       throw new Error('Wait for the current turn and any pending approvals to finish before sending a follow-up.');
     }
     if (!trimmed) {
@@ -266,6 +275,8 @@ export class AgentController {
     }
     const wasWaiting = this.awaitingInput;
     if (wasWaiting) {
+      // A follow-up in the same live native session (no new thread, no replay).
+      this.sessionEmitter.fire({ kind: 'nativeTurn', taskId: this.taskId });
       this.recorder.startTurn(this.taskId);
       this.awaitingInput = false;
       this.progress = undefined;
@@ -278,12 +289,14 @@ export class AgentController {
       simulated: adapter.simulated,
       operationType: 'Instruct',
       description: `Instruction: ${trimmed.length > 160 ? trimmed.slice(0, 157) + '…' : trimmed}`,
-      rationale: trimmed,
+      rationale: agentNote ? `${trimmed}
+
+[Sent with: ${agentNote.trim()}]` : trimmed,
       requiresApproval: false,
       enforcement: 'none',
     });
     try {
-      await adapter.steer(trimmed);
+      await adapter.steer(agentNote + trimmed, attachments);
       return this.recorder.updateOperation(
         op.operationId,
         { status: 'Completed', resultSummary: 'Delivered to the active turn.' },
@@ -713,7 +726,11 @@ export class AgentController {
           this.emitState();
         }
       },
-      setSession: (session) => this.recorder.setSession(ctx.taskId, session),
+      setSession: (session) => {
+        this.recorder.setSession(ctx.taskId, session);
+        this.sessionEmitter.fire({ kind: 'session', taskId: ctx.taskId, session });
+      },
+      reportUsage: (usage) => this.sessionEmitter.fire({ kind: 'usage', taskId: ctx.taskId, usage }),
       setPreview: (p) => {
         if (this.stopRequested) return;
         const had = !!this.preview;
@@ -889,3 +906,8 @@ function countBy(values: string[]): Record<string, number> {
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
+
+export type SessionEvent =
+  | { kind: 'session'; taskId: string; session: import('../types/events').NativeSession }
+  | { kind: 'usage'; taskId: string; usage: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number; totalTokens?: number } }
+  | { kind: 'nativeTurn'; taskId: string };

@@ -1,3 +1,4 @@
+import { PromptAttachment, validateAttachments } from './attachments';
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { AgentController } from '../controller/AgentController';
@@ -6,7 +7,8 @@ import { locateCodex } from '../adapters/codex/codexLocator';
 import { CodexProfileId, getProfile } from '../adapters/codex/profiles';
 import { StreamingAgentAdapter } from '../adapters/AgentAdapter';
 import { OpenCodeAdapter } from './opencode/OpenCodeAdapter';
-import { locateOpenCode, startOpenCodeServer } from './opencode/OpenCodeServer';
+import { locateOpenCode, OpenCodeLaunch } from './opencode/OpenCodeServer';
+import { OpenCodeServerManager } from './opencode/OpenCodeServerManager';
 import { ClaudeCodeAdapter } from './claude/ClaudeCodeAdapter';
 import { claudeSdkEntry, loadClaudeQuery } from './claude/claudeSdk';
 import {
@@ -49,6 +51,8 @@ export class AgentLauncher {
   private readonly modelCache = new Map<string, ModelOption[]>();
   private readonly pendingSave = new Map<string, TaskSelection>();
   private claudeRuntime?: ClaudeRuntime;
+  /** The local OpenCode server: started when needed, reused, monitored, stopped only if this window owns it. */
+  readonly opencode: OpenCodeServerManager;
 
   private async resolveClaude(): Promise<ClaudeRuntime> {
     return this.claudeRuntime = await resolveClaudeRuntime(process.env, this.cfg().get<string>('claude.executablePath', '').trim() || undefined, this.cfg().get<ClaudeAuthMode>('claude.authMode', 'auto'));
@@ -62,6 +66,11 @@ export class AgentLauncher {
     private readonly recorder: EventRecorder,
     private readonly localInferenceBusy: () => boolean = () => false,
   ) {
+    this.opencode = new OpenCodeServerManager({
+      stateFile: path.join((context.storageUri ?? context.globalStorageUri).fsPath, 'opencode-server.json'),
+      log: (line) => log.appendLine(line),
+      idleStopMs: Math.max(0, this.cfg().get<number>('local.server.idleStopMinutes', 15)) * 60_000,
+    });
     controller.onDidChangeState((s) => {
       // Remember a selection only once its task completed successfully.
       if (s.taskId && s.taskStatus !== 'Running') {
@@ -87,6 +96,7 @@ export class AgentLauncher {
           await this.controller.endSession(); await this.controller.whenIdle();
         }
         const transfer: ProjectTransfer = { workspaceFile, history: this.recorder.exportHistory(), taskId: this.context.workspaceState.get<string>('visualAgent.selectedConversation'), selection };
+        transfer.revealObserver = reveal;
         await this.context.globalState.update(PROJECT_TRANSFER_KEY, transfer);
       },
     });
@@ -214,11 +224,18 @@ export class AgentLauncher {
   }
 
   /** Continue the selected conversation, preserving its visible identity and recorded turns. */
-  async send(taskId: string, text: string, useSavedContext = false): Promise<boolean> {
-    const instruction = text.trim();
+  async send(taskId: string, text: string, useSavedContext = false, files?: PromptAttachment[]): Promise<boolean> {
+    const attachments = validateAttachments(files);
+    const instruction = (text.trim() || (attachments.length ? "Please review the attachments." : "")) + (attachments.length ? "\n\nAttachments: " + attachments.map((a) => a.name).join(", ") : "");
     if (!instruction || instruction.length > 4000) throw new Error('Enter a message of 1–4000 characters.');
     const task = this.recorder.getTask(taskId);
     if (!task) throw new Error('Conversation not found.');
+    if (task.source === 'local' && attachments.some((a) => a.mime.startsWith('image/'))) {
+      const response = await fetch(`${this.ollamaEndpoint().replace(/\/+$/, '')}/api/show`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: task.launch?.model }), signal: AbortSignal.timeout(10000) });
+      if (!response.ok) throw new Error('无法确认本地模型是否支持图片，请稍后重试。');
+      const info = await response.json() as { capabilities?: string[] };
+      if (!info.capabilities?.includes('vision')) throw new Error('当前本地模型不支持图片。请使用支持视觉的模型，或移除图片。 / This local model does not support images.');
+    }
     const project = task.workspaceRoot ?? task.launch?.workspaceRoot;
     if (project && !(await this.showProject(project, false))) return false;
     if (task.source === 'local' && this.localInferenceBusy()) throw new Error('The local reviewer is working. Wait for it to finish, then continue with this same coding model.');
@@ -226,7 +243,8 @@ export class AgentLauncher {
     if (this.controller.isActive) {
       if (!snapshot.awaitingInput || snapshot.pendingApprovals.length) throw new Error('Wait for the active turn or its approval before sending another message.');
       if (snapshot.taskId === taskId) {
-        await this.controller.steer(instruction);
+        // Same live native session: a new turn, plus a note only if files the agent saw have changed.
+        await this.controller.steer(instruction, attachments, this.sessions?.changeNote(taskId) ?? '');
         return true;
       }
       await this.controller.endSession();
@@ -245,16 +263,30 @@ export class AgentLauncher {
     const model = models.find((m) => m.id === selection.model && m.compatible);
     if (!model) throw new Error(`Saved model ${selection.model} is unavailable; no model was substituted. Start a new conversation to choose another model.`);
     if (selection.provider === 'local' && !(await this.confirmLocalResources(selection.model, model))) return false;
-    const nativeSession = !useSavedContext && selection.provider === 'local' ? task.session?.id : undefined;
-    const prompt = nativeSession ? instruction : continuationContext(task, this.recorder.getOperations(taskId)) + instruction;
+    // Only this conversation's own native session, and only for the same provider (never another agent's thread).
+    const own = task.session && task.session.provider === selection.provider ? task.session : undefined;
+    const nativeSession = !useSavedContext ? own?.id : undefined;
+    const reason = nativeSession ? undefined : useSavedContext ? 'continuing with saved context was chosen' : task.session ? `the recorded session belongs to ${task.session.provider}` : 'no native session was recorded for this conversation';
+    // Compact, labelled summary for a new session (used directly, or by the adapter if resuming fails).
+    const reconstruct = (why?: string) => (this.sessions ? this.sessions.reconstructedContext(task, this.recorder.getOperations(taskId), why) : continuationContext(task, this.recorder.getOperations(taskId)));
+    const prompt = nativeSession ? (this.sessions?.changeNote(taskId) ?? '') + instruction : reconstruct(reason) + instruction;
     this.navigator.setRoot(selection.workspaceRoot);
-    this.controller.start(prompt, this.createAdapter(selection, model, nativeSession, claude), selection.workspaceRoot, { taskId, userMessage: instruction });
+    this.controller.start(prompt, this.createAdapter(selection, model, nativeSession, claude, { reconstructedContext: reconstruct, reason, originalRequirements: task.description }), selection.workspaceRoot, { taskId, userMessage: instruction, attachments });
     this.pendingSave.set(taskId, selection);
-    this.log.appendLine(`[launcher] continuing ${taskId}: ${nativeSession ? 'native OpenCode session' : 'saved context in a new provider session'}; model=${selection.model}`);
+    this.log.appendLine(`[launcher] continuing ${taskId}: ${nativeSession ? `resuming native ${selection.provider} session ${nativeSession}` : `new ${selection.provider} session with reconstructed context (${reason})`}; model=${selection.model}`);
     return true;
   }
 
-  createAdapter(sel: TaskSelection, m: ModelOption, resumeSessionId?: string, claude = this.claudeRuntime): StreamingAgentAdapter {
+  /** Lightweight per-conversation context (change notes, reconstructed summaries, continuity metrics). */
+  sessions: import('./sessionContext').SessionContextTracker | undefined;
+
+  createAdapter(
+    sel: TaskSelection,
+    m: ModelOption,
+    resumeSessionId?: string,
+    claude = this.claudeRuntime,
+    continuation?: { reconstructedContext: (reason?: string) => string; reason?: string; originalRequirements?: string },
+  ): StreamingAgentAdapter {
     if (sel.provider === 'codex') {
       const loc = locateCodex(this.cfg().get<string>('codex.executablePath', '').trim() || undefined)!;
       return new CodexAppServerAdapter({
@@ -262,26 +294,24 @@ export class AgentLauncher {
         profile: getProfile(sel.profile as CodexProfileId),
         model: sel.model,
         effort: sel.effort,
+        resumeThreadId: resumeSessionId,
+        reconstructedContext: continuation?.reconstructedContext,
+        reconstructedReason: resumeSessionId ? undefined : continuation?.reason,
         maxTurnMs: Math.max(1, this.cfg().get<number>('codex.maxTurnMinutes', 30)) * 60_000,
         clientVersion: String(this.context.extension.packageJSON.version ?? '0.4.0'),
       });
     }
     if (sel.provider === 'local') {
-      const exe = locateOpenCode(this.cfg().get<string>('local.opencodePath', '').trim() || undefined, this.context.extensionUri.fsPath)!;
-      const configured = Math.max(4096, this.cfg().get<number>('local.contextLimit', 32768));
       return new OpenCodeAdapter({
         resumeSessionId,
         workflow: this.cfg().get<'plan-files' | 'direct'>('local.workflow', 'plan-files'),
-        connector: startOpenCodeServer,
-        launch: {
-          executable: exe,
-          homeDir: path.join(this.context.globalStorageUri.fsPath, 'opencode-home'),
-          ollamaBaseUrl: this.ollamaEndpoint(),
-          model: sel.model,
-          contextLimit: m.contextLength ? Math.min(configured, m.contextLength) : configured,
-          outputLimit: Math.max(1024, this.cfg().get<number>('local.outputLimit', 8192)),
-          profile: sel.profile === 'approved-write' ? 'approved-write' : 'read-only',
-        },
+        originalRequirements: continuation?.originalRequirements,
+        diagnostics: (absolutePath) => vscode.languages.getDiagnostics(vscode.Uri.file(absolutePath))
+          .filter((diagnostic) => diagnostic.severity === vscode.DiagnosticSeverity.Error)
+          .map((diagnostic) => diagnostic.message),
+        connector: this.opencode.connector,
+        launch: this.localLaunch(sel, m),
+        reconstructedReason: resumeSessionId ? undefined : continuation?.reason,
       });
     }
     return new ClaudeCodeAdapter({
@@ -292,7 +322,44 @@ export class AgentLauncher {
       env: claude?.env ?? process.env,
       authentication: claude?.authentication,
       pathToClaudeCodeExecutable: claude?.executable,
+      resumeSessionId,
+      reconstructedContext: continuation?.reconstructedContext,
+      reconstructedReason: resumeSessionId ? undefined : continuation?.reason,
     });
+  }
+
+  /** OpenCode server settings for a local-agent selection (identical settings → the same, reused server). */
+  localLaunch(sel: Pick<TaskSelection, 'model' | 'profile' | 'workspaceRoot'>, m: ModelOption): OpenCodeLaunch {
+    const exe = locateOpenCode(this.cfg().get<string>('local.opencodePath', '').trim() || undefined, this.context.extensionUri.fsPath);
+    if (!exe) throw new Error('OpenCode runtime not found (npm install -g opencode-ai, or set visualAgent.local.opencodePath).');
+    const configured = Math.max(4096, this.cfg().get<number>('local.contextLimit', 32768));
+    const contextLimit = m.contextLength ? Math.min(configured, m.contextLength) : configured;
+    return {
+      executable: exe,
+      homeDir: path.join(this.context.globalStorageUri.fsPath, 'opencode-home'),
+      workspaceRoot: sel.workspaceRoot,
+      ollamaBaseUrl: this.ollamaEndpoint(),
+      model: sel.model,
+      contextLimit,
+      outputLimit: Math.min(Math.max(1024, this.cfg().get<number>('local.outputLimit', 8192)), Math.max(1, Math.floor(contextLimit / 4))),
+      profile: sel.profile === 'approved-write' ? 'approved-write' : 'read-only',
+    };
+  }
+
+  /**
+   * Start the OpenCode server now with the last local-agent settings (status
+   * menu, or `visualAgent.local.server.autoStart = onActivation`). Uses the
+   * Ollama model list only (no inference). Returns why it did not start.
+   */
+  async startLocalServer(): Promise<string | undefined> {
+    const last = this.lastSelection().byProvider.local;
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!last) return 'No local-agent task has been started yet, so there are no model/profile settings to start the server with. It starts automatically with the first local-agent task.';
+    if (!root) return 'Open a folder first.';
+    const m = (await this.models('local', root)).find((x) => x.id === last.model);
+    if (!m) return `The last local model "${last.model}" is not available in Ollama; it will not be substituted.`;
+    await this.opencode.ensure(this.localLaunch({ model: last.model, profile: last.profile, workspaceRoot: root }, m));
+    return undefined;
   }
 
   /** Never load a second large local model without the user's say-so. */

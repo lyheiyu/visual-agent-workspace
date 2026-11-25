@@ -18,6 +18,7 @@ export class ActivityViewProvider implements vscode.WebviewViewProvider, vscode.
   static readonly viewId = 'visualAgent.activity';
 
   private view: vscode.WebviewView | undefined;
+  private panel: vscode.WebviewPanel | undefined;
   private pending: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
 
@@ -40,7 +41,33 @@ export class ActivityViewProvider implements vscode.WebviewViewProvider, vscode.
     );
   }
 
+  /** Keep the observer visible in a separate editor group while Explorer is open. */
+  showBeside(): void {
+    if (this.panel) {
+      // Already visible: just refresh. Hidden behind another tab (e.g. the conversation in the same group):
+      // show it beside the active group instead of on top of what the user is looking at.
+      if (!this.panel.visible) this.panel.reveal(vscode.ViewColumn.Beside, true);
+      this.post();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      'visualAgent.activityObserver', 'Agent Activity',
+      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')] },
+    );
+    this.panel = panel;
+    panel.webview.html = this.html(panel.webview, vscode.Uri.joinPath(this.extensionUri, 'media'));
+    const messages = panel.webview.onDidReceiveMessage((msg) => this.onMessage(msg));
+    const visibility = panel.onDidChangeViewState(() => panel.visible && this.post());
+    panel.onDidDispose(() => {
+      messages.dispose();
+      visibility.dispose();
+      if (this.panel === panel) this.panel = undefined;
+    });
+  }
+
   dispose(): void {
+    this.panel?.dispose();
     this.disposables.forEach((d) => d.dispose());
     if (this.pending) {
       clearTimeout(this.pending);
@@ -58,10 +85,12 @@ export class ActivityViewProvider implements vscode.WebviewViewProvider, vscode.
   }
 
   private post(): void {
-    if (!this.view) {
+    if (!this.view && !this.panel) {
       return;
     }
-    void this.view.webview.postMessage({ type: 'state', model: this.controls.getViewModel() });
+    const message = { type: 'state', model: this.controls.getViewModel() };
+    void this.view?.webview.postMessage(message);
+    void this.panel?.webview.postMessage(message);
   }
 
   private onMessage(msg: unknown): void {
@@ -73,6 +102,9 @@ export class ActivityViewProvider implements vscode.WebviewViewProvider, vscode.
     switch (m.type) {
       case 'ready':
         this.post();
+        return;
+      case 'expand':
+        this.controls.setExpanded(typeof m.operationId === 'string' ? m.operationId : undefined);
         return;
       case 'select':
         if (id) {

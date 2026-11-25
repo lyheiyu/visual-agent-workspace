@@ -47,6 +47,29 @@ async function ready(controller, recorder, id) {
     assert.equal(recorder.getTask(id).status, 'Completed');
     assert.equal(repo.status(), '');
     console.log('PASS: same-session follow-up remembers marker; two turn results; normal session close.');
+
+    // Native resume after the session ended (as after a reload): same session ID, only the new message is sent.
+    const sessionId = recorder.getTask(id).session && recorder.getTask(id).session.id;
+    assert.ok(sessionId, 'session ID recorded');
+    const adapterFor = (resumeSessionId) => new ClaudeCodeAdapter({ loadQuery: async () => query, model: model.id, effort: model.efforts?.includes('low') ? 'low' : undefined, profile: 'read-only', env: runtime.env, authentication: runtime.authentication, pathToClaudeCodeExecutable: runtime.executable, resumeSessionId, reconstructedContext: (reason) => `[Reconstructed context: ${reason}. No marker is known.]\n` });
+    const ask = 'What was our marker? Reply with just the marker, or NONE if you do not know it. Do not use tools.';
+    controller.start(ask, adapterFor(sessionId), repo.dir, { taskId: id, userMessage: ask });
+    await ready(controller, recorder, id);
+    assert.equal(recorder.getTask(id).session.id, sessionId, 'same Claude session');
+    assert.equal(recorder.getTask(id).session.continuity, 'resumed');
+    assert.match(recorder.getTask(id).messages.at(-1).text, /AMBER392/);
+    await controller.endSession(); await controller.whenIdle();
+    console.log(`PASS: native resume of ${sessionId} after the session ended; marker remembered without replay.`);
+
+    // Recovery: a session that no longer exists → new session with the labelled reconstructed context.
+    controller.start(ask, adapterFor('00000000-0000-4000-8000-000000000000'), repo.dir, { taskId: id, userMessage: ask });
+    await ready(controller, recorder, id);
+    const recovered = recorder.getTask(id).session;
+    assert.equal(recovered.continuity, 'reconstructed', JSON.stringify(recovered));
+    assert.notEqual(recovered.id, sessionId);
+    console.log(`PASS: missing session recovered as a new session (${recovered.recoveryReason}); answer: ${recorder.getTask(id).messages.at(-1).text.slice(0, 40)}`);
+    await controller.endSession(); await controller.whenIdle();
+    assert.equal(repo.status(), '');
   } finally {
     if (controller.isActive) controller.stop();
     await controller.whenIdle();

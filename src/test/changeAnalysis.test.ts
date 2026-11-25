@@ -5,9 +5,48 @@ import * as path from 'node:path';
 import { analyzeFileChange, changedRanges } from '../analysis/changeAnalysis';
 import { listFunctionRanges } from '../navigation/symbolSearch';
 import { CodexItemMapper } from '../adapters/codex/CodexItemMapper';
+import { extractChangeContext } from '../reviewer/changeContext';
+import { reviewChangesPrompt } from '../reviewer/prompts';
+import { formatReviewOutput } from '../reviewer/reviewOutput';
 
 const ROOT = path.resolve(__dirname, '..', '..', 'demo-workspace');
 const validation = fs.readFileSync(path.join(ROOT, 'validation.py'), 'utf8');
+
+test('operation #111 anchors the review at line 57 and ignores fixture text that looks like code', () => {
+  const filePath = 'src/test/changeContext.test.ts';
+  const originalLine = '  const small = reviewChangePrompt(input, 95);';
+  const modifiedLine = '  const small = reviewChangePrompt(input, 115);';
+  const lines = [
+    ...Array.from({ length: 36 }, () => ''),
+    'test("fixture", () => {',
+    "  const original = 'function f() { return true; }';",
+    '  /* function commentedOut() {} */',
+    "  const rawPatch = '@@ -1 +1 @@\\n-unmatched\\n+replacement';",
+    ...Array.from({ length: 7 }, () => ''),
+    '});',
+    'test("retains operation references", () => {',
+    ...Array.from({ length: 7 }, () => ''),
+    originalLine,
+    '});',
+  ];
+  const diff = `@@ -57 +57 @@\n-${originalLine}\n+${modifiedLine}\n`;
+  const before = lines.join('\n') + '\n';
+  const analysis = analyzeFileChange(filePath, before, diff);
+  assert.deepEqual(analysis.ranges, [{ filePath, side: 'new', startLine: 57, endLine: 57 }]);
+  assert.deepEqual(analysis.functions, []);
+  const extracted = extractChangeContext(filePath, before, analysis.newText!);
+  assert.deepEqual(extracted.blocks.map(({ side, startLine, changed }) => [side, startLine, changed]), [
+    ['after', 49, '57'], ['before', 49, '57'],
+  ]);
+  const prompt = reviewChangesPrompt([{ filePath, ...extracted }], 'operation #111 (Completed)', 500);
+  assert.doesNotMatch(prompt.context, /function f\(\)|commentedOut|rawPatch/);
+  const finding = { status: 'change', side: 'after', line: 57, quote: modifiedLine.trim(), message: 'Raises the test budget.' };
+  const result = formatReviewOutput(JSON.stringify([
+    finding, finding, { ...finding, status: 'confirmed', line: 38, quote: 'function f()', message: 'Fabricated finding.' },
+  ]), prompt.reviewOutput!, 'en');
+  assert.equal(result.text.match(/Raises the test budget/g)?.length, 1);
+  assert.doesNotMatch(result.text, /Fabricated finding/);
+});
 
 test('lists Python functions, classes and methods with extents', () => {
   const fns = listFunctionRanges(validation, 'python').map((f) => `${f.kind}:${f.name}:${f.startLine + 1}-${f.endLine + 1}`);

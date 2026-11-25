@@ -2,12 +2,13 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { EventRecorder } from '../recorder/EventRecorder';
 import { ChangeReviewManager } from '../review/ChangeReviewManager';
-import { createUnifiedDiff } from '../review/unifiedDiff';
+import { extractChangeContext } from './changeContext';
+import { contextBudget, diffHunks, explainDiff } from './diffBatches';
 import { FunctionRange, guessLanguage, innermost, listFunctionRanges } from '../navigation/symbolSearch';
 import { extractErrorLocations, findCallees, findCallSites, referencedModuleDefinitions, SourceFile } from '../analysis/staticAnalysis';
 import { AgentOperation } from '../types/events';
 import { ReviewRequest, ReviewResult, ReviewService } from './ReviewService';
-import { CodeBlock, explainCommandPrompt, explainErrorPrompt, explainFunctionPrompt, impactPrompt, reviewChangePrompt } from './prompts';
+import { CodeBlock, explainCommandPrompt, explainErrorPrompt, explainFunctionPrompt, impactPrompt, reviewChangesPrompt } from './prompts';
 import { describeCommand } from '../analysis/commandInfo';
 import { redactSecrets } from '../recorder/redaction';
 import { localizeError, normalizeLanguage, t, UiLanguage } from '../i18n/i18n';
@@ -65,6 +66,7 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     const reg = (id: string, fn: (...a: any[]) => unknown) => this.disposables.push(vscode.commands.registerCommand(id, fn));
     reg('visualAgent.reviewer.explainFunction', () => this.guard(() => this.explainFunction()));
     reg('visualAgent.reviewer.reviewChange', (opId?: string) => this.guard(() => this.reviewChange(typeof opId === 'string' ? opId : undefined)));
+    reg('visualAgent.reviewer.explainDiff', (opId?: string) => this.guard(() => this.reviewChange(typeof opId === 'string' ? opId : undefined, true)));
     reg('visualAgent.reviewer.impactAnalysis', () => this.guard(() => this.impactAnalysis()));
     reg('visualAgent.reviewer.explainError', (opId?: string) => this.guard(() => this.explainError(typeof opId === 'string' ? opId : undefined)));
     reg('visualAgent.reviewer.explainCommand', (opId?: string) => this.guard(() => this.explainCommand(typeof opId === 'string' ? opId : undefined)));
@@ -81,8 +83,8 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
 
   // ------------------------------------------------------------- actions
 
-  async explainFunction(): Promise<ReviewResult | undefined> {
-    const t = await this.functionAtCursor();
+  async explainFunction(editor?: vscode.TextEditor, taskId?: string): Promise<ReviewResult | undefined> {
+    const t = await this.functionAtCursor(editor, !!taskId);
     const budget = this.budget();
     const lang = t.document.languageId;
     const built = explainFunctionPrompt(
@@ -99,12 +101,12 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     return this.execute({
       kind: 'explain',
       title: `Explain ${t.name ? `${t.name}()` : 'selection'} · ${t.relPath}`,
-      subject: { filePath: t.relPath, functionName: t.name, startLine: t.startLine + 1, endLine: t.endLine + 1 },
+      subject: { filePath: t.relPath, functionName: t.name, startLine: t.startLine + 1, endLine: t.endLine + 1, taskId },
       ...built,
     });
   }
 
-  async reviewChange(operationId?: string): Promise<ReviewResult | undefined> {
+  async reviewChange(operationId?: string, explainOnly = false): Promise<ReviewResult | undefined> {
     let op: AgentOperation | undefined;
     let fnName: string | undefined;
     let relPath: string | undefined;
@@ -123,45 +125,86 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     if (!op || (!op.associatedChangeId && !op.associatedChangeIds?.length)) {
       throw new Error('Select an Edit operation (in Agent Activity) or place the cursor in a changed function.');
     }
-    const ids = op.associatedChangeIds ?? [op.associatedChangeId!];
-    const changeRecords = ids.map((id) => this.recorder.getChange(id)).filter(Boolean);
-    const changeId = (relPath && changeRecords.find((c) => samePath(c!.filePath, relPath!))?.changeId) ?? ids[0];
-    const content = await this.changes.getContent(changeId);
-    if (!content) {
-      throw new Error('The content of this change is no longer in memory (changes are kept only for the current session).');
+    const ids = [...new Set([...(op.associatedChangeIds ?? []), ...(op.associatedChangeId ? [op.associatedChangeId] : [])])];
+    const contents = await Promise.all(ids.map(async (id) => {
+      const content = await this.changes.getContent(id);
+      return { content, filePath: content?.change.filePath ?? this.recorder.getChange(id)?.filePath ?? id };
+    }));
+    if (explainOnly) return this.explainDiff(op, contents, relPath, fnName);
+    const files = contents.map(({ content, filePath }) => ({
+      filePath,
+      ...extractChangeContext(filePath, content?.original ?? '', content?.proposed ?? '', !!content && !content.note),
+    }));
+    const file = relPath ?? files[0].filePath;
+    let intent = '';
+    if (explainOnly) {
+      const task = this.recorder.getTask(op.taskId);
+      const request = task?.messages?.slice().reverse().find((message) => message.role === 'user' && message.timestamp <= op.timestamp)?.text ?? task?.description;
+      intent = [...new Set([request, op.rationale])].filter((value): value is string => !!value)
+        .map((value) => truncate(value.replace(/\s+/g, ' '), 160)).join(' / ');
     }
-    const file = content.change.filePath;
-    const lang = guessLanguage(file);
-    const fns = (op.affectedFunctions ?? []).filter((f) => samePath(f.filePath, file) && f.kind !== 'class');
-    fnName ??= fns.length === 1 ? fns[0].name : op.functionName;
-    const diff = content.change.unifiedDiff ?? createUnifiedDiff(content.original, content.proposed) ?? '';
-    const pick = (text: string): CodeBlock | undefined => {
-      const r = fnName ? listFunctionRanges(text, lang).find((d) => d.name === fnName) : undefined;
-      return r ? { filePath: file, startLine: r.startLine + 1, code: sliceLines(text, r.startLine, r.endLine) } : undefined;
-    };
-    const built = reviewChangePrompt(
-      {
-        filePath: file,
-        functionName: fnName,
-        diff,
-        original: content.change.changeKind === 'add' ? undefined : pick(content.original),
-        modified: content.change.changeKind === 'delete' ? undefined : pick(content.proposed),
-        operationRef: `operation #${op.sequenceNumber} (${op.status})`,
-        moduleDefs: referencedModuleDefinitions(content.proposed || content.original, (pick(content.proposed) ?? pick(content.original))?.code ?? diff, lang),
-      },
+    const built = reviewChangesPrompt(
+      files,
+      `operation #${op.sequenceNumber} (${op.status})${intent ? `\nRecorded intent: ${intent}` : ''}`,
       this.budget(),
       this.responseLanguage(),
+      explainOnly,
     );
     return this.execute({
       kind: 'review',
-      title: `Review change ${fnName ? `${fnName}() · ` : ''}${file} (op #${op.sequenceNumber})`,
+      title: `${explainOnly ? 'Explain diff' : 'Review change'} ${files.length === 1 ? file : `${files.length} files`} (op #${op.sequenceNumber})`,
       subject: { filePath: file, functionName: fnName, operationId: op.operationId, taskId: op.taskId },
       ...built,
     });
   }
 
-  async impactAnalysis(): Promise<ReviewResult | undefined> {
-    const t = await this.functionAtCursor();
+  /**
+   * Explain Diff: the diff hunks only (not the before/after files), sized to the selected model's real
+   * context window; one request when it fits, otherwise sequential batches plus one overall explanation.
+   * Read-only: nothing is written; only an explicit user action starts it.
+   */
+  private async explainDiff(op: AgentOperation, contents: Array<{ content: Awaited<ReturnType<ChangeReviewManager['getContent']>>; filePath: string }>, relPath?: string, fnName?: string): Promise<ReviewResult> {
+    const files = contents.map(({ content, filePath }) =>
+      diffHunks(filePath, content?.original ?? '', content?.proposed ?? '', !!content && !content.note));
+    const task = this.recorder.getTask(op.taskId);
+    const request = task?.messages?.slice().reverse().find((message) => message.role === 'user' && message.timestamp <= op.timestamp)?.text ?? task?.description;
+    const intent = [...new Set([request, op.rationale])].filter((value): value is string => !!value)
+      .map((value) => truncate(value.replace(/\s+/g, ' '), 160)).join(' / ');
+    const header = `operation #${op.sequenceNumber} (${op.status})${intent ? `\nRecorded intent: ${intent}` : ''}`;
+    if (this.service.getState().connection !== 'connected') await this.service.refreshModels();
+    const model = this.service.getState().selectedModel;
+    const cfg = vscode.workspace.getConfiguration('visualAgent.reviewer');
+    const budget = contextBudget({
+      setting: cfg.get<number>('contextWindow', 8192),
+      modelLength: model ? await this.service.modelContextLength(model) : undefined,
+      thinking: cfg.get<'off' | 'low' | 'on'>('thinking', 'off'),
+      maxChars: this.budget(),
+    });
+    const language = this.responseLanguage();
+    const hunkCount = files.reduce((a, f) => a + f.hunks.length, 0);
+    this.log.appendLine(`[reviewer] Explain diff: ${files.length} file(s), ${hunkCount} hunk(s); window ${budget.window} tokens (setting ${budget.setting}, model ${budget.modelLength ?? 'unknown'}), input budget ${budget.input} per request`);
+    const file = relPath ?? files[0].filePath;
+    return this.execute({
+      kind: 'review',
+      title: `Explain diff ${files.length === 1 ? file : `${files.length} files`} (op #${op.sequenceNumber})`,
+      subject: { filePath: file, functionName: fnName, operationId: op.operationId, taskId: op.taskId },
+      messages: [],
+      context: '',
+      truncated: false,
+      language,
+      pipeline: {
+        key: JSON.stringify(['explain-diff', header, budget, ...files.map((f) => f.fingerprint)]),
+        run: async (call) => {
+          const r = await explainDiff({ files, header, budget, language, call });
+          this.log.appendLine(`[reviewer] Explain diff: ${r.requests} request(s), ${r.batches} batch(es)${r.incomplete ? ', INCOMPLETE' : ''}`);
+          return r;
+        },
+      },
+    });
+  }
+
+  async impactAnalysis(editor?: vscode.TextEditor, taskId?: string): Promise<ReviewResult | undefined> {
+    const t = await this.functionAtCursor(editor);
     if (!t.name) {
       throw new Error('Place the cursor inside a named function for impact analysis.');
     }
@@ -183,7 +226,7 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     return this.execute({
       kind: 'impact',
       title: `Impact of ${t.name}() · ${t.relPath}`,
-      subject: { filePath: t.relPath, functionName: t.name, startLine: t.startLine + 1, endLine: t.endLine + 1 },
+      subject: { filePath: t.relPath, functionName: t.name, startLine: t.startLine + 1, endLine: t.endLine + 1, taskId },
       ...built,
     });
   }
@@ -191,12 +234,14 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
   async explainError(operationId?: string): Promise<ReviewResult | undefined> {
     let op = this.recorder.getOperation(operationId ?? this.selectedOperationId() ?? '');
     if (!op || !isFailedCommand(op)) {
+      if (operationId) throw new Error('This operation has no recorded command failure.');
       op = await this.pickFailedCommand();
       if (!op) {
         return undefined;
       }
     }
-    const root = workspaceRoot();
+    const task = this.recorder.getTask(op.taskId);
+    const root = task?.workspaceRoot ?? task?.launch?.workspaceRoot ?? workspaceRoot();
     const output = [op.command!.stdout, op.command!.stderr].filter(Boolean).join('\n');
     const related: CodeBlock[] = [];
     for (const loc of extractErrorLocations(output, root, op.command!.workingDirectory, 3)) {
@@ -384,6 +429,9 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
       }
     }, 50);
     const result = await running;
+    if (req.reviewOutput && result.status === 'done') {
+      this.log.appendLine(`[reviewer] Structured change review for ${req.reviewOutput.files?.length ?? 1} file(s) (evidence checked, duplicates filtered${result.cached ? ', cached' : ''})`);
+    }
     this.log.appendLine(`[reviewer] ${result.kind} with ${result.model}: ${result.status}${result.cached ? ' (cached)' : ''} in ${result.durationMs ?? 0} ms`);
     if (result.status === 'error') {
       void vscode.window.showWarningMessage(`Local AI Reviewer: ${result.error}`);
@@ -420,14 +468,17 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
   }
 
   /** Function at the cursor: language-server symbols first, then the text parser, then the selection. */
-  async functionAtCursor(): Promise<FunctionTarget> {
-    const editor = vscode.window.activeTextEditor;
+  async functionAtCursor(editor = vscode.window.activeTextEditor, allowNearby = false): Promise<FunctionTarget> {
     if (!editor || editor.document.uri.scheme !== 'file') {
       throw new Error('Open a source file and place the cursor inside a function.');
     }
     const doc = editor.document;
     const pos = editor.selection.active;
     const relPath = vscode.workspace.asRelativePath(doc.uri);
+    if (allowNearby && !editor.selection.isEmpty) {
+      const end = editor.selection.end;
+      return { document: doc, relPath, startLine: editor.selection.start.line, endLine: end.character === 0 ? end.line - 1 : end.line, source: 'selection' };
+    }
     try {
       const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[] | undefined>('vscode.executeDocumentSymbolProvider', doc.uri);
       const kinds = new Set([vscode.SymbolKind.Function, vscode.SymbolKind.Method, vscode.SymbolKind.Constructor]);
@@ -458,6 +509,9 @@ export class ReviewerController implements vscode.TextDocumentContentProvider, v
     }
     if (!editor.selection.isEmpty) {
       return { document: doc, relPath, startLine: editor.selection.start.line, endLine: editor.selection.end.line, source: 'selection' };
+    }
+    if (allowNearby) {
+      return { document: doc, relPath, startLine: Math.max(0, pos.line - 4), endLine: Math.min(doc.lineCount - 1, pos.line + 4), source: 'selection' };
     }
     throw new Error('No function found at the cursor. Place the cursor inside a function or select some code.');
   }
@@ -570,7 +624,8 @@ export function renderResultMarkdown(r: ReviewResult): string {
   const subject = [r.subject.filePath, r.subject.functionName && `${r.subject.functionName}()`, r.subject.startLine && `lines ${r.subject.startLine}–${r.subject.endLine}`]
     .filter(Boolean)
     .join(' · ');
-  const status = r.status === 'streaming' ? '⏳ streaming…' : r.status === 'done' ? (r.cached ? 'done (cached result)' : 'done') : r.status === 'cancelled' ? 'cancelled' : `error: ${r.error}`;
+  const status = (r.status === 'streaming' ? `⏳ ${r.progress ?? 'streaming…'}` : r.status === 'done' ? (r.cached ? 'done (cached result)' : 'done') : r.status === 'cancelled' ? 'cancelled' : `error: ${r.error}`)
+    + (r.incomplete ? ' — ⚠ incomplete (see Coverage)' : '') + (r.requests && r.requests > 1 ? ` · ${r.requests} requests` : '');
   return redactSecrets(
     [
       `# ${r.title}`,

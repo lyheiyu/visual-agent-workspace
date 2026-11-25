@@ -10,6 +10,7 @@ import { AgentOperation } from '../types/events';
 import { CODEX_PROFILES, CodexProfileId } from '../adapters/codex/profiles';
 import { ProposalReview } from '../review/ProposalReview';
 import { localizeError, normalizeLanguage, UiLanguage } from '../i18n/i18n';
+import { Notice, showNotice } from './notices';
 
 export interface TaskStarters {
   demo: () => string;
@@ -40,6 +41,8 @@ export const CONTROL_ACTIONS = [
   'openChat',
   'editProposal',
   'applyEdited',
+  'previewEdited',
+  'cancelEdit',
   'regenerate',
   'aiExplainCommand',
   'record',
@@ -68,6 +71,12 @@ export class HumanControlManager implements vscode.Disposable {
   private readonly statusBar: vscode.StatusBarItem;
   private navigationQueue: Promise<unknown> = Promise.resolve();
   private promptedFor = new Set<string>();
+  /** One shared approval notification while anything is pending; the operations it covers. */
+  private approvalNotice: Notice | undefined;
+  private approvalNoticeFor: string[] = [];
+  /** Approve/reject calls in progress (a double click or two panels must not decide twice). */
+  private readonly deciding = new Set<string>();
+  private readonly rejecting = new Set<string>();
   /** Review before writing: conflict gate, edit-before-apply, regenerate with feedback. */
   readonly proposals: ProposalReview;
 
@@ -95,7 +104,10 @@ export class HumanControlManager implements vscode.Disposable {
 
     const recSub = recorder.onDidChange((c) => this.onRecorderChange(c));
     const ctlSub = controller.onDidChangeState((s) => this.onControllerState(s));
-    const chgSub = controller.onDidProposeChange((c) => this.review.prepare(c));
+    const chgSub = controller.onDidProposeChange((change) => {
+      const task = this.recorder.getTask(change.taskId);
+      this.review.prepare(change, task?.workspaceRoot ?? task?.launch?.workspaceRoot);
+    });
     this.disposables.push({ dispose: () => [recSub, ctlSub, chgSub].forEach((d) => d.dispose()) });
 
     this.onControllerState(controller.getSnapshot());
@@ -161,13 +173,24 @@ export class HumanControlManager implements vscode.Disposable {
   }
 
   getViewModel(): ActivityViewModel {
-    return buildActivityViewModel(this.recorder, this.controller.getSnapshot(), {
+    const vm = buildActivityViewModel(this.recorder, this.controller.getSnapshot(), {
       reviewerEnabled: vscode.workspace.getConfiguration('visualAgent').get<boolean>('reviewer.enabled', true),
       language: this.language(),
       follow: this.follow,
       selectedTaskId: this.selectedTaskId,
       selectedOperationId: this.selectedOperationId,
+      expandedOperationId: this.expandedOperationId,
     });
+    // Same decision state as the Conversation card: a proposal being edited is applied, not approved.
+    for (const op of vm.operations) if (op.awaitingApproval && this.proposals.isEditing(op.id)) op.editing = true;
+    return vm;
+  }
+
+  /** Step the user expanded by hand in Agent Activity (its details stay available while Follow moves on). */
+  private expandedOperationId: string | undefined;
+  setExpanded(operationId: string | undefined): void {
+    this.expandedOperationId = operationId && this.recorder.getOperation(operationId) ? operationId : undefined;
+    this.viewEmitter.fire();
   }
 
   selectTask(taskId: string): void {
@@ -249,6 +272,12 @@ export class HumanControlManager implements vscode.Disposable {
           return;
         case 'applyEdited':
           await this.proposals.applyEditedVersion(this.pendingId(operationId));
+          return;
+        case 'previewEdited':
+          await this.proposals.previewEditedVersion(this.pendingId(operationId));
+          return;
+        case 'cancelEdit':
+          await this.proposals.cancelEditing(this.pendingId(operationId));
           return;
         case 'regenerate':
           await this.proposals.regenerate(this.pendingId(operationId));
@@ -427,6 +456,26 @@ export class HumanControlManager implements vscode.Disposable {
 
   private async approve(operationId?: string): Promise<void> {
     const id = operationId ?? this.controller.getSnapshot().awaitingApprovalFor;
+    if (id && this.alreadyDecided(id)) return;
+    if (id && this.deciding.has(id)) return; // the same decision is already being made
+    if (id) this.deciding.add(id);
+    try {
+      await this.approveNow(id);
+    } finally {
+      if (id) this.deciding.delete(id);
+    }
+  }
+
+  /** A repeated click on a decision that was already made (here or in another panel): nothing to do, no warning. */
+  private alreadyDecided(id: string): boolean {
+    const op = this.recorder.getOperation(id);
+    if (!op || this.controller.getSnapshot().pendingApprovals.includes(id) || op.status === 'Proposed') return false;
+    this.log.appendLine(`[control] ${id} was already decided (${op.status}); ignoring the repeated action`);
+    vscode.window.setStatusBarMessage(`$(info) Already ${op.status.toLowerCase()}`, 2500);
+    return true;
+  }
+
+  private async approveNow(id: string | undefined): Promise<void> {
     if (id && this.controller.getSnapshot().pendingApprovals.includes(id) && !(await this.proposals.guardApproval(id))) {
       return;
     }
@@ -440,13 +489,14 @@ export class HumanControlManager implements vscode.Disposable {
       const unseen = ids.filter((changeId) => !this.review.hasDisplayed(changeId));
       if (unseen.length) {
         for (const changeId of unseen) {
-          if (!(await this.review.showDiff(changeId, { preserveFocus: false }))) return;
+          if (!(await this.review.showDiff(changeId, { preserveFocus: false, pending: () => this.controller.getSnapshot().pendingApprovals.includes(op.operationId) }))) return;
         }
-        void vscode.window.showInformationMessage('Review the proposed changes, then approve again to apply. Nothing has been written. / 请先查看差异，再次批准才会写入。');
+        showNotice('Review the proposed changes, then approve again to apply. Nothing has been written. / 请先查看差异，再次批准才会写入。', { ms: 6000 });
         return;
       }
     }
     if (!id || !this.controller.approve(id)) {
+      if (id && this.alreadyDecided(id)) return;
       void vscode.window.showWarningMessage(localizeError('That operation is not awaiting approval.', this.language()));
       return;
     }
@@ -455,19 +505,23 @@ export class HumanControlManager implements vscode.Disposable {
 
   private async reject(operationId?: string): Promise<void> {
     const id = operationId ?? this.controller.getSnapshot().awaitingApprovalFor;
+    if (id && (this.alreadyDecided(id) || this.rejecting.has(id))) return; // a reason box is already open for it
     if (!id || !this.controller.getSnapshot().pendingApprovals.includes(id)) {
       void vscode.window.showWarningMessage(localizeError('That operation is not awaiting approval.', this.language()));
       return;
     }
+    this.rejecting.add(id);
     const reason = await vscode.window.showInputBox({
       title: 'Reject proposed operation',
       prompt: 'Optional: why are you rejecting it? (recorded in the audit trail). Press Esc to cancel the rejection.',
       placeHolder: 'Reason (optional)',
     });
+    this.rejecting.delete(id);
     if (reason === undefined) {
       return; // user cancelled the rejection itself
     }
     if (!this.controller.reject(id, reason.trim() || undefined)) {
+      if (this.alreadyDecided(id)) return; // decided elsewhere while the reason box was open
       void vscode.window.showWarningMessage('The operation is no longer awaiting approval.');
       return;
     }
@@ -484,16 +538,18 @@ export class HumanControlManager implements vscode.Disposable {
     const task = this.recorder.getTask(op.taskId);
     this.navigator.setRoot(task?.workspaceRoot ?? task?.launch?.workspaceRoot);
     const changeIds = op.associatedChangeIds ?? (op.associatedChangeId ? [op.associatedChangeId] : []);
+    const pending = () => this.controller.getSnapshot().pendingApprovals.includes(op.operationId);
+    const options = { preserveFocus: false, pending: pending() ? pending : undefined };
     if (changeIds.length > 1) {
       const pick = await vscode.window.showQuickPick(
         changeIds.map((id) => ({ label: this.recorder.getChange(id)?.filePath ?? id, id })),
         { title: 'This patch changes several files. A decision covers all of them.' },
       );
       if (pick) {
-        await this.review.showDiff(pick.id, { preserveFocus: false });
+        await this.review.showDiff(pick.id, options);
       }
     } else if (changeIds.length === 1) {
-      await this.review.showDiff(changeIds[0], { preserveFocus: false });
+      await this.review.showDiff(changeIds[0], options);
     } else {
       await this.openRecord(RecordDocumentProvider.operationUri(op.operationId), 'markdown');
     }
@@ -635,7 +691,7 @@ export class HumanControlManager implements vscode.Disposable {
       if (op.associatedChangeId) {
         const changeId = op.associatedChangeId;
         this.navigationQueue = this.navigationQueue.then(() =>
-          this.review.showDiff(changeId, { preserveFocus: true, viewColumn: vscode.ViewColumn.Beside }),
+          this.review.showDiff(changeId, { preserveFocus: true, viewColumn: vscode.ViewColumn.Beside, pending: () => this.controller.getSnapshot().pendingApprovals.includes(op.operationId) }),
         );
       }
       this.viewEmitter.fire();
@@ -650,7 +706,7 @@ export class HumanControlManager implements vscode.Disposable {
     void vscode.commands.executeCommand('setContext', 'visualAgent.awaitingApproval', active && !!s.awaitingApprovalFor);
     void vscode.commands.executeCommand('setContext', 'visualAgent.followAgent', this.follow);
     void vscode.commands.executeCommand('setContext', 'visualAgent.canPause', active && s.capabilities.pause);
-    void vscode.commands.executeCommand('setContext', 'visualAgent.canSteer', active && s.capabilities.steer && (!s.capabilities.followUp || s.awaitingInput));
+    void vscode.commands.executeCommand('setContext', 'visualAgent.canSteer', active && s.capabilities.steer && (!s.capabilities.followUp || !!s.capabilities.steerWhileRunning || s.awaitingInput));
     void vscode.commands.executeCommand('setContext', 'visualAgent.canEndSession', active && !!s.capabilities.followUp && s.awaitingInput);
 
     for (const id of s.pendingApprovals) {
@@ -679,42 +735,60 @@ export class HumanControlManager implements vscode.Disposable {
         void this.notifyFinished(s);
       }
     }
+    this.updateApprovalNotice(active ? s.pendingApprovals : []);
     this.viewEmitter.fire();
   }
 
   // -------------------------------------------------------------- helpers
 
-  private async promptForDecision(op: AgentOperation): Promise<void> {
-    if (this.promptedFor.has(op.operationId)) {
+  /**
+   * Remembers that the operation was announced; the shared approval
+   * notification (updateApprovalNotice) covers it.
+   */
+  private promptForDecision(op: AgentOperation): void {
+    this.promptedFor.add(op.operationId);
+  }
+
+  /**
+   * One self-closing approval notification while anything is pending. It is a
+   * progress notification (VS Code cannot close message toasts from code): its
+   * text follows the pending list, and it closes as soon as nothing is pending
+   * (approved, rejected, cancelled or the task ended, wherever that happened).
+   * Deciding happens in the Conversation or Agent Activity panel, so there is
+   * one place with buttons and never a stale one.
+   */
+  private updateApprovalNotice(pending: readonly string[]): void {
+    const ops = pending.map((id) => this.recorder.getOperation(id)).filter((o): o is AgentOperation => !!o);
+    if (!ops.length) {
+      this.approvalNotice?.dispose();
+      this.approvalNotice = undefined;
+      this.approvalNoticeFor = [];
       return;
     }
-    this.promptedFor.add(op.operationId);
-    const target = [op.filePath, op.functionName && `${op.functionName}()`].filter(Boolean).join(' › ');
-    const sim = op.simulated
-      ? ' [SIMULATED: nothing will be written to disk]'
+    const ids = ops.map((o) => o.operationId);
+    if (this.approvalNotice?.open && ids.join() === this.approvalNoticeFor.join()) return;
+    const op = ops[0];
+    const codex = op.source === 'codex';
+    const what = op.simulated
+      ? 'simulated, nothing is written'
       : op.operationType === 'Edit'
-        ? ' [REAL: approving lets Codex apply this ENTIRE patch]'
-        : ' [REAL: Codex is waiting; an approved command may run outside its read-only sandbox and change files]';
-    for (;;) {
-      const options = op.associatedChangeId ? ['Review Diff', 'Approve', 'Reject'] : ['Approve', 'Reject'];
-      const choice = await vscode.window.showInformationMessage(
-        `Agent proposes: ${op.description}${target ? ` (${target})` : ''}.${sim}`,
-        ...options,
-      );
-      if (!this.controller.getSnapshot().pendingApprovals.includes(op.operationId)) {
-        return; // decided elsewhere (sidebar/command) or task stopped
-      }
-      if (choice === 'Review Diff') {
-        await this.reviewOperation(op.operationId);
-        continue; // re-prompt after reviewing
-      }
-      if (choice === 'Approve') {
-        this.approve(op.operationId);
-      } else if (choice === 'Reject') {
-        await this.reject(op.operationId);
-      }
-      return; // dismissed: the sidebar still offers Approve/Reject
+        ? `approving lets ${codex ? 'Codex' : 'the agent'} apply this entire patch`
+        : codex
+          ? 'an approved command may run outside the read-only sandbox and change files'
+          : 'an approved command runs in your workspace and may change files';
+    const target = [op.filePath, op.functionName && `${op.functionName}()`].filter(Boolean).join(' › ');
+    const more = ops.length > 1 ? ` (+${ops.length - 1} more / 另有 ${ops.length - 1} 项)` : '';
+    const text = `${op.description}${target && !op.description.includes(target) ? ` (${target})` : ''}${more} — ${what}.`;
+    if (!this.approvalNotice?.open) {
+      this.approvalNotice = showNotice('Approval needed — decide in Conversation or Agent Activity / 需要批准：请在会话或代理活动面板中决定');
     }
+    this.approvalNotice.update(text);
+    this.approvalNoticeFor = ids;
+  }
+
+  /** Operation IDs covered by the open approval notification (tests, diagnostics). */
+  openApprovalNotices(): string[] {
+    return this.approvalNotice?.open ? [...this.approvalNoticeFor] : [];
   }
 
   private finishedNotified = new Set<string>();
@@ -733,6 +807,12 @@ export class HumanControlManager implements vscode.Disposable {
   }
 
   private revealOperation(op: AgentOperation, userInitiated: boolean): Promise<void> {
+    // A delayed Follow event must not override an explicit selection made afterwards.
+    if (userInitiated) {
+      if (this.followTimer) clearTimeout(this.followTimer);
+      this.followTimer = undefined;
+      this.followTarget = undefined;
+    }
     const label = `◀ Agent: ${op.operationType}${op.functionName ? ` ${op.functionName}()` : ''}${op.simulated ? ' (simulated)' : ''}`;
     // Applied patches: highlight the actual changed lines in the file on disk.
     // Not-yet-applied patches: jump to where the change will land (the diff shows the content).
@@ -740,7 +820,7 @@ export class HumanControlManager implements vscode.Disposable {
     const highlightLines = applied
       ? op.changedRanges?.filter((r) => r.side === 'new' && r.filePath === op.filePath)
       : undefined;
-    const task = this.navigationQueue.then(async () => {
+    const task = this.navigationQueue.catch(() => undefined).then(async () => {
       const result = await this.navigator.navigate(
         {
           filePath: op.filePath,

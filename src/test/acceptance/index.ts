@@ -188,6 +188,52 @@ export async function run(): Promise<void> {
     } else {
       observe('commands', 'the agent ran no command in this session; command checks skipped');
     }
+
+    // ---------------------------------------------------------- 5. OpenCode server lifecycle (real server, real VS Code)
+    console.log('\n[5] OpenCode server: reuse, crash recovery, reconnect, restart, stop');
+    const server = launcher.opencode;
+    const s0 = server.status();
+    check('server Running after the session ended (kept for reuse), owned by this window', s0.state === 'Running' && !!s0.pid && s0.connections === 0, `pid ${s0.pid} · port ${s0.port} · OpenCode ${s0.version}`);
+    const turnDone = async (what: string) => {
+      for (let i = 0; i < 6; i++) {
+        const s = await until(() => (controller.getSnapshot().awaitingInput && 'idle') || controller.getSnapshot().awaitingApprovalFor || (!controller.isActive && 'ended'), what, 300_000);
+        if (s === 'idle' || s === 'ended' || !s) return s;
+        controller.reject(s, 'No changes in this turn.');
+      }
+      return undefined;
+    };
+    const t1 = Date.now();
+    await launcher.send(taskId, 'Reply with the single word READY. Do not use any tools.');
+    check('next turn reuses the same server (no new process)', server.status().pid === s0.pid, `connected in ${Date.now() - t1} ms`);
+    await turnDone('turn on the reused server');
+    await controller.endSession();
+    await controller.whenIdle();
+    // Unexpected server exit while idle → Error → automatic restart.
+    const { execFileSync } = await import('node:child_process');
+    const states: string[] = [];
+    const watch = server.onStatus((s) => states.at(-1) !== s.state && states.push(s.state));
+    execFileSync('taskkill', ['/PID', String(s0.pid), '/F'], { stdio: 'ignore' });
+    const recovered = await until(() => server.status().state === 'Running' && server.status().pid !== s0.pid && server.status(), 'automatic restart', 30_000);
+    watch.dispose();
+    check('unexpected exit detected and recovered automatically', !!recovered && states.includes('Error'), `states ${states.join(' → ')}; new pid ${recovered && recovered.pid}`);
+    // Reconnect: the same conversation continues on the restarted server (native OpenCode session).
+    await launcher.send(taskId, 'Reply with the single word AGAIN. Do not use any tools.');
+    const end = await turnDone('turn after the restart');
+    const restored = recorder.getOperations(taskId).filter((o) => /Local agent session restored/.test(o.description)).at(-1);
+    check('same conversation continued on the restarted server (session restored)', end === 'idle' && !!restored && restored.status === 'Completed', restored?.description);
+    await controller.endSession();
+    await controller.whenIdle();
+    // Manual restart and stop (commands).
+    const before5 = server.status().pid;
+    await vscode.commands.executeCommand('visualAgent.opencode.restart');
+    check('Restart command starts a new server process', server.status().state === 'Running' && server.status().pid !== before5, `pid ${before5} → ${server.status().pid}`);
+    const last = server.status().pid!;
+    await vscode.commands.executeCommand('visualAgent.opencode.stop');
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      try { process.kill(last, 0); await new Promise((r) => setTimeout(r, 100)); } catch { alive = false; }
+    }
+    check('Stop command stops the owned server', server.status().state === 'Stopped' && !alive);
   } catch (err) {
     check('acceptance run', false, (err as Error).stack ?? String(err));
   } finally {

@@ -113,6 +113,8 @@ export class ReviewerViewProvider implements vscode.WebviewViewProvider, vscode.
           error: s.current.error,
           durationMs: s.current.durationMs,
           truncated: s.current.truncated,
+          progress: s.current.progress,
+          incomplete: s.current.incomplete,
           language: s.current.language,
           view: s.current.view,
           translations: Object.fromEntries(

@@ -10,6 +10,135 @@ import { FakeOpenCode } from './support/fakeOpenCode';
 import { buildActivityViewModel } from '../ui/viewModel';
 
 const root = path.join(os.tmpdir(), 'vaw-session-contract');
+
+test('OpenCode usage includes cache and reasoning once per completed message', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant('usage');
+    const event = { type: 'message.updated', properties: { sessionID: s.sessionId, info: {
+      id: 'usage', role: 'assistant', time: { completed: Date.now() },
+      tokens: { input: 10, output: 2, reasoning: 3, cache: { read: 7, write: 1 } },
+    } } };
+    s.emit(event); s.emit(event); s.idle();
+  }];
+  const r = new EventRecorder(); const c = controller(r);
+  const usage: unknown[] = [];
+  c.onDidSessionEvent((event) => { if (event.kind === 'usage') usage.push(event.usage); });
+  c.start('Explain code', adapter(fake), root);
+  await ready(c);
+  assert.deepEqual(usage, [{ inputTokens: 18, outputTokens: 5, cachedInputTokens: 7 }]);
+  await c.endSession(); await c.whenIdle();
+});
+
+test('a correction that leaves the test failing still reports unresolved work', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant(); s.tool('bad-test', 'bash', 'completed', { command: 'node test.js' }, { metadata: { exit: 1 } }); s.idle();
+  }, async (s) => { s.assistant('correction'); s.text('claim', 'Done'); s.idle(); }];
+  const r = new EventRecorder(); const c = controller(r);
+  const id = c.start('Fix the code', adapter(fake), root);
+  await ready(c);
+  assert.equal(fake.requests.filter((request) => request.route.endsWith('/prompt_async')).length, 2);
+  assert.ok(r.getOperations(id).some((op) => op.status === 'Failed' && op.resultSummary?.includes('Failing test: node test.js')));
+  await c.endSession(); await c.whenIdle();
+});
+
+test('a real failing test result requests one correction through the existing session and preserves follow-up read-only scope', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [
+    async (s) => { s.assistant(); s.tool('failed-test', 'bash', 'completed', { command: 'node test.js' }, { metadata: { exit: 1 } }); s.idle(); },
+    async (s) => { s.assistant('correction'); s.tool('passed-test', 'bash', 'completed', { command: 'node test.js' }, { metadata: { exit: 0 } }); s.idle(); },
+    async (s) => { s.assistant('followup'); s.idle(); },
+  ];
+  const r = new EventRecorder();
+  const c = controller(r);
+  c.start('Fix code and run tests', adapter(fake), root);
+  await ready(c);
+  const prompts = fake.requests.filter((request) => request.route.endsWith('/prompt_async'));
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1].body.parts[0].text, /Recorded failing test: node test.js/);
+  await c.steer('Only explain. Do not change files.');
+  await ready(c);
+  assert.equal(fake.requests.filter((request) => request.route.endsWith('/prompt_async')).length, 3);
+  await c.endSession(); await c.whenIdle();
+});
+
+test('a corrected edit and passing rerun resolve earlier failures even when descriptive arguments change', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant();
+    s.tool('test-bad', 'bash', 'completed', { command: 'node test.js', description: 'reproduce' }, { metadata: { exit: 1 } });
+    s.tool('edit-bad', 'edit', 'error', { filePath: 'math.js', oldString: 'missing', newString: 'fixed' }, { error: 'not found' });
+    s.tool('edit-good', 'edit', 'completed', { filePath: 'math.js', oldString: 'real target', newString: 'fixed' });
+    s.tool('test-good', 'bash', 'completed', { command: 'node test.js', description: 'verify fix' }, { metadata: { exit: 0 } });
+    s.idle();
+  }];
+  const r = new EventRecorder();
+  const c = controller(r);
+  const id = c.start('Fix code', adapter(fake), root);
+  await ready(c);
+  assert.ok(!r.getOperations(id).some((op) => op.description === 'Local task has unresolved work'));
+  await c.endSession(); await c.whenIdle();
+});
+
+test('three identical failed actions stop execution while preserving the native session', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant();
+    for (let i = 0; i < 3; i++) {
+      s.tool('failed-' + i, 'edit', 'error', { filePath: 'math.js', oldString: 'missing', newString: 'fixed' }, { error: 'target not found' });
+    }
+  }];
+  const r = new EventRecorder();
+  const c = controller(r);
+  const id = c.start('Fix the utility', adapter(fake), root);
+  await c.whenIdle();
+  assert.equal(fake.aborted, true);
+  assert.equal(r.getTask(id)?.session?.id, fake.sessionId);
+  assert.equal(r.getTask(id)?.status, 'Failed');
+  assert.ok(r.getOperations(id).some((op) => op.description === 'Repeated unsuccessful local action'));
+});
+
+test('a completion message cannot hide pending todos and failed tool results', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    s.assistant();
+    s.tool('todo', 'todowrite', 'completed', { todos: [{ content: 'Document behavior in README', status: 'pending' }] });
+    s.tool('broken', 'edit', 'error', { filePath: 'README.md', oldString: 'missing', newString: 'text' }, { error: 'target not found' });
+    s.text('claim', 'Everything is complete.');
+    s.idle();
+  }, async (s) => { s.assistant('next'); s.idle(); }];
+  const r = new EventRecorder();
+  const c = controller(r);
+  const id = c.start('Fix code and document it', adapter(fake), root);
+  await ready(c);
+  assert.ok(r.getOperations(id).some((op) => op.status === 'Failed' && op.resultSummary?.includes('Document behavior in README')));
+  await c.steer('Continue pending work');
+  await ready(c);
+  const system = fake.requests.filter((request) => request.route.endsWith('/prompt_async'))[1].body.system;
+  assert.match(system, /Fix code and document it/);
+  assert.match(system, /Document behavior in README/);
+  await c.endSession(); await c.whenIdle();
+});
+
+test('runaway native model steps stop the turn without discarding its session', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => {
+    for (let i = 0; i < 49; i++) {
+      const event = { type: 'message.part.updated', properties: { sessionID: s.sessionId, part: { type: 'step-start', id: 'step-' + i } } };
+      s.emit(event);
+      s.emit(event);
+    }
+  }];
+  const r = new EventRecorder();
+  const c = controller(r);
+  const id = c.start('Fix the utility', adapter(fake), root);
+  await c.whenIdle();
+  assert.equal(fake.aborted, true);
+  assert.equal(r.getTask(id)?.session?.id, fake.sessionId);
+  assert.equal(r.getTask(id)?.status, 'Failed');
+  assert.equal(r.getOperations(id).filter((op) => op.description === 'Local agent step limit reached').length, 1);
+});
 function adapter(fake: FakeOpenCode, resumeSessionId?: string) {
   return new OpenCodeAdapter({ resumeSessionId, connector: async () => fake, launch: { executable: 'fixture', homeDir: root, ollamaBaseUrl: 'http://127.0.0.1:11434', model: 'qwen3:8b', contextLimit: 8192, outputLimit: 2048, profile: 'approved-write' } });
 }
@@ -19,6 +148,19 @@ async function ready(c: AgentController) {
   while (!c.getSnapshot().awaitingInput && c.isActive && Date.now() < end) await new Promise((r) => setTimeout(r, 5));
   assert.equal(c.getSnapshot().awaitingInput, true);
 }
+
+test('local follow-ups deliver text and image bytes as native OpenCode parts', async () => {
+  const fake = new FakeOpenCode();
+  fake.turns = [async (s) => s.idle(), async (s) => s.idle()];
+  const r = new EventRecorder(); const c = controller(r);
+  c.start('Hello', adapter(fake), root); await ready(c);
+  await c.steer('See attachments', [{ name: 'notes.txt', mime: 'text/plain', data: Buffer.from('attached notes').toString('base64') }, { name: 'screen.png', mime: 'image/png', data: 'aW1hZ2U=' }]);
+  await ready(c);
+  const body = fake.requests.filter((request) => request.route.endsWith('/prompt_async'))[1].body;
+  assert.match(body.parts[0].text, /attached notes/);
+  assert.deepEqual(body.parts[1], { type: 'file', mime: 'image/png', filename: 'screen.png', url: 'data:image/png;base64,aW1hZ2U=' });
+  await c.endSession(); await c.whenIdle();
+});
 
 test('native local session survives recorder reload and new runtime, keeping one conversation and per-turn results', async () => {
   let saved: PersistedHistory | undefined;

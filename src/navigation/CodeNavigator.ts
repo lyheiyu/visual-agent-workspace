@@ -117,10 +117,13 @@ export class CodeNavigator implements vscode.Disposable {
     }
 
     const located = await this.locate(document, target);
+    // Never cover a panel the user is working in (the conversation with its approval card is a webview tab):
+    // open the file beside it instead.
+    const overPanel = !options.viewColumn && vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputWebview;
     const editor = await vscode.window.showTextDocument(document, {
       preserveFocus: options.preserveFocus,
       preview: options.preview ?? true,
-      viewColumn: options.viewColumn,
+      viewColumn: options.viewColumn ?? (overPanel ? vscode.ViewColumn.Beside : undefined),
       selection: options.preserveFocus ? undefined : new vscode.Range(located.range.start, located.range.start),
     });
     if (located.matchedBy === 'line' && target.column && target.column > 1 && !options.preserveFocus) {

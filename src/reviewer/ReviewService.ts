@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Emitter } from '../util/emitter';
-import { ChatMessage, OllamaClient, OllamaError, OllamaModel, thinkParam } from './OllamaClient';
+import { ChatMessage, ChatResult, OllamaClient, OllamaError, OllamaModel, thinkParam } from './OllamaClient';
 import { codeSpansPreserved, ResponseLanguage, ReviewKind, translatePrompt } from './prompts';
+import { formatReviewOutput, ReviewOutputContext } from './reviewOutput';
 
 export type TranslationTarget = 'zh-CN' | 'en';
 
@@ -37,6 +38,16 @@ export interface ReviewRequest {
   language?: ResponseLanguage;
   /** Explicit re-run: ask the model again instead of returning a cached answer. */
   noCache?: boolean;
+  reviewOutput?: ReviewOutputContext;
+  /**
+   * Several requests for one result (Explain Diff in batches). `call` sends one chat request with the
+   * selected model; calls are awaited one after another, never in parallel. Cancellation aborts the
+   * running call. `key` identifies the input for the cache (the result is cached only when complete).
+   */
+  pipeline?: {
+    key: string;
+    run: (call: (messages: ChatMessage[], label: string, maxOutputTokens?: number) => Promise<ChatResult>) => Promise<{ text: string; incomplete: boolean; cacheable: boolean; context?: string }>;
+  };
 }
 
 export interface ReviewResult {
@@ -62,6 +73,12 @@ export interface ReviewResult {
   promptTokens?: number;
   outputTokens?: number;
   durationMs?: number;
+  /** Shown while streaming, e.g. "Analysing batch 2 of 4". */
+  progress?: string;
+  /** Not every part of the input was analysed (shown in the status line). */
+  incomplete?: boolean;
+  /** Model requests made for this result. */
+  requests?: number;
 }
 
 export type ConnectionState = 'disabled' | 'unknown' | 'checking' | 'connected' | 'unavailable';
@@ -159,6 +176,21 @@ export class ReviewService {
     return true;
   }
 
+  private readonly contextLengths = new Map<string, number | undefined>();
+
+  /** The model's trained context length from Ollama metadata (no inference); undefined if unavailable. */
+  async modelContextLength(model: string): Promise<number | undefined> {
+    if (this.contextLengths.has(model)) return this.contextLengths.get(model);
+    let value: number | undefined;
+    try {
+      value = (await this.client().show(model)).contextLength;
+    } catch {
+      value = undefined; // older Ollama or no metadata: the configured window is used
+    }
+    this.contextLengths.set(model, value);
+    return value;
+  }
+
   /** Run one review. Rejects if disabled, busy, or no model is selected. */
   async run(req: ReviewRequest): Promise<ReviewResult> {
     if (!this.options.enabled()) {
@@ -174,7 +206,7 @@ export class ReviewService {
     if (!model) {
       throw new Error(this.state.error ?? 'No local model is available.');
     }
-    const key = cacheKey(model, req, this.options.thinking());
+    const key = cacheKey(model, req, this.options.thinking(), this.options.contextWindow());
     const hit = req.noCache ? undefined : this.cache.get(key);
     if (hit) {
       const cached: ReviewResult = { ...hit, id: randomUUID(), cached: true, subject: req.subject, title: req.title, translations: { ...hit.translations }, view: 'original' };
@@ -205,6 +237,31 @@ export class ReviewService {
     this.set({ busy: true, current: { ...result } });
     const t0 = Date.now();
     try {
+      if (req.pipeline) {
+        const client = this.client();
+        const signal = this.abort.signal;
+        const done = await req.pipeline.run(async (messages, label, maxOutputTokens) => {
+          signal.throwIfAborted?.();
+          result.progress = label;
+          result.requests = (result.requests ?? 0) + 1;
+          this.set({ current: { ...result } });
+          this.inferenceRequests++;
+          const out = await client.chat(
+            { model, messages, think: thinkParam(model, this.options.thinking()), options: { temperature: 0.2, num_ctx: this.options.contextWindow(), ...(maxOutputTokens ? { num_predict: maxOutputTokens } : {}) } },
+            { signal, onDelta: (text, kind) => { if (kind === 'thinking') { result.thinking += text; this.emitSoon(); } } },
+          );
+          result.promptTokens = (result.promptTokens ?? 0) + (out.promptTokens ?? 0);
+          result.outputTokens = (result.outputTokens ?? 0) + (out.outputTokens ?? 0);
+          return out;
+        });
+        result.text = done.text;
+        result.incomplete = done.incomplete;
+        if (done.context !== undefined) result.context = done.context;
+        result.progress = undefined;
+        result.status = 'done';
+        if (done.cacheable) this.cache.set(key, { ...result, translations: {}, view: 'original' });
+        return result;
+      }
       this.inferenceRequests++;
       const out = await this.client().chat(
         {
@@ -216,27 +273,33 @@ export class ReviewService {
         {
           signal: this.abort.signal,
           onDelta: (text, kind) => {
-            if (kind === 'content') {
+            if (kind === 'content' && !req.reviewOutput) {
               result.text += text;
-            } else {
+            } else if (kind === 'thinking') {
               result.thinking += text;
+            } else {
+              return;
             }
             this.emitSoon();
           },
         },
       );
-      result.text = out.content;
+      const formatted = req.reviewOutput && formatReviewOutput(out.content, req.reviewOutput, result.language);
+      result.text = formatted ? formatted.text : out.content;
       result.thinking = out.thinking;
       result.promptTokens = out.promptTokens;
       result.outputTokens = out.outputTokens;
       result.status = 'done';
-      this.cache.set(key, { ...result, translations: {}, view: 'original' });
+      if (!formatted || formatted.cacheable) {
+        this.cache.set(key, { ...result, translations: {}, view: 'original' });
+      }
       if (this.cache.size > 50) {
         this.cache.delete(this.cache.keys().next().value!);
       }
     } catch (err) {
       const e = err as OllamaError;
-      result.status = e.kind === 'aborted' ? 'cancelled' : 'error';
+      result.progress = undefined;
+      result.status = e.kind === 'aborted' || this.abort?.signal.aborted ? 'cancelled' : 'error';
       result.error = e.message;
       if (e.kind === 'unreachable') {
         this.set({ connection: 'unavailable', error: e.message });
@@ -405,8 +468,8 @@ export class ReviewService {
   }
 }
 
-function cacheKey(model: string, req: ReviewRequest, thinking: string): string {
+function cacheKey(model: string, req: ReviewRequest, thinking: string, contextWindow: number): string {
   return createHash('sha256')
-    .update(JSON.stringify([model, thinking, req.kind, req.messages]))
+    .update(JSON.stringify([model, thinking, contextWindow, req.kind, req.language, req.messages, req.reviewOutput?.fingerprint, req.pipeline?.key]))
     .digest('hex');
 }
